@@ -1,0 +1,53 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  1.3                                   |
+|   \\  /    A nd           | Web:      http://www.openfoam.org               |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+
+
+
+FoamFile
+{
+	version         2.0;
+	format          ascii;
+	root            "/home/mangani/OpenFOAM-1.5-dev/mangani-1.5-dev/run/C3XFC/OpenFoam";
+	case            "circ_bump";
+	instance        "system";
+	local           "";
+	class           dictionary;
+	object          controlDict;
+}
+//---------------------------------------------------------------------------//
+
+application            SteadyCompFpa;
+
+startFrom              startTime; //latestTime; //startTime;
+
+startTime              0;
+
+stopAt                 endTime; //endTime; //writeNow;
+
+endTime                155;
+
+deltaT                 1;
+
+writeControl           timeStep; //runTime;
+
+writeInterval          100;
+
+purgeWrite             2;
+
+writeFormat            binary;
+writePrecision	        8;
+writeCompression       uncompressed;
+
+timeFormat             general;
+
+timePrecision          6;
+
+graphFormat            raw;
+
+runTimeModifiable      yes;
+
