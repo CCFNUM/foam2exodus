@@ -70,6 +70,8 @@ private:
     
     std::string stripComments(const std::string& line);
     bool skipHeaderAndDetectFormat(std::ifstream& file);
+    int parseLeadingInt(const std::string& line, size_t* endPos = nullptr);
+    std::vector<int> parseIntListFromString(const std::string& line);
     
     // Binary reading helpers
     template<typename T>

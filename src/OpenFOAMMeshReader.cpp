@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
+#include <cctype>
 
 OpenFOAMMeshReader::OpenFOAMMeshReader(const std::string& casePath) 
     : meshPath(casePath + "/constant/polyMesh") {}
@@ -136,6 +137,50 @@ std::string getNextNonEmptyLine(std::ifstream& file) {
     return "";
 }
 
+int OpenFOAMMeshReader::parseLeadingInt(const std::string& line, size_t* endPos) {
+    size_t idx = 0;
+    while (idx < line.size() && std::isspace(static_cast<unsigned char>(line[idx]))) {
+        idx++;
+    }
+    
+    size_t start = idx;
+    if (idx < line.size() && (line[idx] == '+' || line[idx] == '-')) {
+        idx++;
+    }
+    
+    size_t digitsStart = idx;
+    while (idx < line.size() && std::isdigit(static_cast<unsigned char>(line[idx]))) {
+        idx++;
+    }
+    
+    if (digitsStart == idx) {
+        throw std::runtime_error("Error parsing integer from line: '" + line + "'");
+    }
+    
+    if (endPos) {
+        *endPos = idx;
+    }
+    
+    return std::stoi(line.substr(start, idx - start));
+}
+
+std::vector<int> OpenFOAMMeshReader::parseIntListFromString(const std::string& line) {
+    std::string cleaned = line;
+    for (char& c : cleaned) {
+        if (c == '(' || c == ')' || c == ';') {
+            c = ' ';
+        }
+    }
+    
+    std::istringstream iss(cleaned);
+    int value;
+    std::vector<int> values;
+    while (iss >> value) {
+        values.push_back(value);
+    }
+    return values;
+}
+
 void OpenFOAMMeshReader::readPointsBinary(std::ifstream& file, int nPoints) {
     // Skip whitespace and read opening parenthesis
     char c;
@@ -212,7 +257,7 @@ void OpenFOAMMeshReader::readFacesBinary(std::ifstream& file, int nFaces) {
     std::string line = getNextNonEmptyLine(file);
     int totalData;
     try {
-        totalData = std::stoi(line);
+        totalData = parseLeadingInt(line);
     } catch (const std::exception& e) {
         throw std::runtime_error("Error parsing total face data count from line: '" + line + "' - " + e.what());
     }
@@ -337,13 +382,13 @@ void OpenFOAMMeshReader::readPoints() {
     
     if (isBinary) {
         std::string line = getNextNonEmptyLine(file);
-        int nPoints = std::stoi(line);
+        int nPoints = parseLeadingInt(line);
         readPointsBinary(file, nPoints);
     } else {
         std::string line = getNextNonEmptyLine(file);
         int nPoints;
         try {
-            nPoints = std::stoi(line);
+            nPoints = parseLeadingInt(line);
         } catch (const std::exception& e) {
             throw std::runtime_error("Error parsing number of points from line: '" + line + "' - " + e.what());
         }
@@ -376,7 +421,7 @@ void OpenFOAMMeshReader::readFaces() {
     std::string line = getNextNonEmptyLine(file);
     int nFaces;
     try {
-        nFaces = std::stoi(line);
+        nFaces = parseLeadingInt(line);
     } catch (const std::exception& e) {
         throw std::runtime_error("Error parsing number of faces from line: '" + line + "' - " + e.what());
     }
@@ -391,7 +436,7 @@ void OpenFOAMMeshReader::readFaces() {
             size_t pos = line.find('(');
             if (pos != std::string::npos) {
                 std::string numStr = line.substr(0, pos);
-                int nPointsInFace = std::stoi(numStr);
+                int nPointsInFace = parseLeadingInt(numStr);
                 
                 std::string pointsStr = line.substr(pos + 1);
                 pointsStr.erase(std::remove(pointsStr.begin(), pointsStr.end(), ')'), pointsStr.end());
@@ -420,8 +465,9 @@ void OpenFOAMMeshReader::readOwner() {
     
     std::string line = getNextNonEmptyLine(file);
     int nFaces;
+    size_t consumedChars = 0;
     try {
-        nFaces = std::stoi(line);
+        nFaces = parseLeadingInt(line, &consumedChars);
     } catch (const std::exception& e) {
         throw std::runtime_error("Error parsing number of faces from owner file, line: '" + line + "' - " + e.what());
     }
@@ -430,9 +476,20 @@ void OpenFOAMMeshReader::readOwner() {
         readOwnerBinary(file, nFaces);
     } else {
         owner.reserve(nFaces);
-        for (int i = 0; i < nFaces; ++i) {
+        
+        std::vector<int> pending = parseIntListFromString(line.substr(consumedChars));
+        size_t pendingIdx = 0;
+        while (pendingIdx < pending.size() && owner.size() < nFaces) {
+            owner.push_back(pending[pendingIdx++]);
+        }
+        
+        while (owner.size() < nFaces) {
             line = getNextNonEmptyLine(file);
-            owner.push_back(std::stoi(line));
+            auto values = parseIntListFromString(line);
+            for (int value : values) {
+                owner.push_back(value);
+                if (owner.size() == nFaces) break;
+            }
         }
     }
     
@@ -450,8 +507,9 @@ void OpenFOAMMeshReader::readNeighbour() {
     
     std::string line = getNextNonEmptyLine(file);
     int nInternalFaces;
+    size_t consumedChars = 0;
     try {
-        nInternalFaces = std::stoi(line);
+        nInternalFaces = parseLeadingInt(line, &consumedChars);
     } catch (const std::exception& e) {
         throw std::runtime_error("Error parsing number of internal faces from neighbour file, line: '" + line + "' - " + e.what());
     }
@@ -460,9 +518,20 @@ void OpenFOAMMeshReader::readNeighbour() {
         readNeighbourBinary(file, nInternalFaces);
     } else {
         neighbour.reserve(nInternalFaces);
-        for (int i = 0; i < nInternalFaces; ++i) {
+        
+        std::vector<int> pending = parseIntListFromString(line.substr(consumedChars));
+        size_t pendingIdx = 0;
+        while (pendingIdx < pending.size() && neighbour.size() < nInternalFaces) {
+            neighbour.push_back(pending[pendingIdx++]);
+        }
+        
+        while (neighbour.size() < nInternalFaces) {
             line = getNextNonEmptyLine(file);
-            neighbour.push_back(std::stoi(line));
+            auto values = parseIntListFromString(line);
+            for (int value : values) {
+                neighbour.push_back(value);
+                if (neighbour.size() == nInternalFaces) break;
+            }
         }
     }
     
@@ -480,7 +549,7 @@ void OpenFOAMMeshReader::readBoundary() {
     std::string line = getNextNonEmptyLine(file);
     int nPatches;
     try {
-        nPatches = std::stoi(line);
+        nPatches = parseLeadingInt(line);
     } catch (const std::exception& e) {
         throw std::runtime_error("Error parsing number of patches from boundary file, line: '" + line + "' - " + e.what());
     }
@@ -508,13 +577,13 @@ void OpenFOAMMeshReader::readBoundary() {
                 std::string nFacesStr = line.substr(pos + 6);
                 nFacesStr.erase(std::remove(nFacesStr.begin(), nFacesStr.end(), ' '), nFacesStr.end());
                 nFacesStr.erase(std::remove(nFacesStr.begin(), nFacesStr.end(), ';'), nFacesStr.end());
-                patch.nFaces = std::stoi(nFacesStr);
+                patch.nFaces = parseLeadingInt(nFacesStr);
             } else if (line.find("startFace") != std::string::npos) {
                 size_t pos = line.find("startFace");
                 std::string startFaceStr = line.substr(pos + 9);
                 startFaceStr.erase(std::remove(startFaceStr.begin(), startFaceStr.end(), ' '), startFaceStr.end());
                 startFaceStr.erase(std::remove(startFaceStr.begin(), startFaceStr.end(), ';'), startFaceStr.end());
-                patch.startFace = std::stoi(startFaceStr);
+                patch.startFace = parseLeadingInt(startFaceStr);
             } else if (line.find('}') != std::string::npos) {
                 break;
             }
@@ -538,7 +607,7 @@ void OpenFOAMMeshReader::readCellZones() {
     std::string line = getNextNonEmptyLine(file);
     int nZones;
     try {
-        nZones = std::stoi(line);
+        nZones = parseLeadingInt(line);
     } catch (const std::exception& e) {
         std::cout << "Could not parse number of zones, assuming 0 zones" << std::endl;
         return;
@@ -591,7 +660,7 @@ void OpenFOAMMeshReader::readCellZones() {
                     while (iss >> word) {
                         if (word != "cellLabels") {
                             try {
-                                nCells = std::stoi(word);
+                                nCells = parseLeadingInt(word);
                             } catch (...) {}
                         }
                     }
@@ -609,7 +678,7 @@ void OpenFOAMMeshReader::readCellZones() {
                     line = getNextNonEmptyLine(file);
                     int nCells;
                     try {
-                        nCells = std::stoi(line);
+                        nCells = parseLeadingInt(line);
                     } catch (const std::exception& e) {
                         throw std::runtime_error("Error parsing number of cells in zone, line: '" + line + "' - " + e.what());
                     }
@@ -619,7 +688,7 @@ void OpenFOAMMeshReader::readCellZones() {
                     zone.cellIndices.reserve(nCells);
                     for (int j = 0; j < nCells; ++j) {
                         line = getNextNonEmptyLine(file);
-                        zone.cellIndices.push_back(std::stoi(line));
+                        zone.cellIndices.push_back(parseLeadingInt(line));
                     }
                 }
                 
