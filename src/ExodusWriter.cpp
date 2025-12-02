@@ -442,7 +442,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
             
             for (const auto& [cellType, cellIndices] : zoneElemsByType) {
                 BlockInfo block;
-                block.name = zone.name + "-" + cellType;
+                std::string originalName = zone.name + "-" + cellType;
+                block.name = getBlockName(originalName);
                 block.cellIndices = cellIndices;
                 block.cellType = cellType;
                 blocks.push_back(block);
@@ -458,7 +459,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
         
         for (const auto& [cellType, cellIndices] : unzonedElemsByType) {
             BlockInfo block;
-            block.name = "unzoned-" + cellType;
+            std::string originalName = "unzoned-" + cellType;
+            block.name = getBlockName(originalName);
             block.cellIndices = cellIndices;
             block.cellType = cellType;
             blocks.push_back(block);
@@ -471,7 +473,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
         
         for (const auto& [cellType, cellIndices] : elemsByType) {
             BlockInfo block;
-            block.name = "fluid-" + cellType;
+            std::string originalName = "fluid-" + cellType;
+            block.name = getBlockName(originalName);
             block.cellIndices = cellIndices;
             block.cellType = cellType;
             blocks.push_back(block);
@@ -654,8 +657,9 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader) {
         int var_elem_ss, var_side_ss;
         nc_def_var(ncid, ("elem_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_elem_ss);
         nc_def_var(ncid, ("side_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_side_ss);
-        
-        nc_put_att_text(ncid, var_elem_ss, "name", patch.name.length(), patch.name.c_str());
+
+        std::string sidesetName = getSidesetName(patch.name);
+        nc_put_att_text(ncid, var_elem_ss, "name", sidesetName.length(), sidesetName.c_str());
     }
     
     int var_ss_names;
@@ -716,34 +720,38 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader) {
         int var_prop;
         nc_inq_varid(ncid, "ss_prop1", &var_prop);
         nc_put_var1_int(ncid, var_prop, &index, &ss_id);
-        
+
+        std::string sidesetName = getSidesetName(patch.name);
         char name_padded[33];
         std::memset(name_padded, 0, 33);
-        std::strncpy(name_padded, patch.name.c_str(), 32);
-        
+        std::strncpy(name_padded, sidesetName.c_str(), 32);
+
         nc_inq_varid(ncid, "ss_names", &var_id);
         size_t start[2] = {i, 0};
         size_t count[2] = {1, 33};
         nc_put_vara_text(ncid, var_id, start, count, name_padded);
-        
-        std::cout << "Wrote sideset " << (i + 1) << ": " << patch.name 
+
+        std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
                   << " with " << patch.nFaces << " faces" << std::endl;
     }
 }
 
 void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader) {
+    customElementBlockNames.clear();
+    customSidesetNames.clear();
+
     int numNodes = reader.getNumPoints();
     int numElems = reader.getNumCells();
     int numNodeSets = 0;
     int numSideSets = reader.getNumBoundaryPatches();
-    
+
     const auto& cells = reader.getCells();
     const auto& cellZones = reader.getCellZones();
-    
+
     int numElemBlocks = 0;
     if (!cellZones.empty()) {
         std::set<int> zonedCells;
-        
+
         for (const auto& zone : cellZones) {
             std::set<std::string> typesInZone;
             for (int cellIdx : zone.cellIndices) {
@@ -754,7 +762,7 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader) {
             }
             numElemBlocks += typesInZone.size();
         }
-        
+
         std::set<std::string> unzonedTypes;
         for (size_t i = 0; i < cells.size(); ++i) {
             if (zonedCells.find(i) == zonedCells.end()) {
@@ -769,11 +777,35 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader) {
         }
         numElemBlocks = elemsByType.size();
     }
-    
+
     initializeExodusFile(numNodes, numElems, numElemBlocks, numNodeSets, numSideSets);
     writeNodes(reader.getPoints());
     writeElements(reader);
     writeSideSets(reader);
-    
+
     std::cout << "Successfully wrote Exodus II file: " << filename << std::endl;
+}
+
+void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader,
+                             const std::map<std::string, std::string>& elementBlockNames,
+                             const std::map<std::string, std::string>& sidesetNames) {
+    customElementBlockNames = elementBlockNames;
+    customSidesetNames = sidesetNames;
+    writeMesh(reader);
+}
+
+std::string ExodusWriter::getBlockName(const std::string& originalName) {
+    auto it = customElementBlockNames.find(originalName);
+    if (it != customElementBlockNames.end() && !it->second.empty()) {
+        return it->second;
+    }
+    return originalName;
+}
+
+std::string ExodusWriter::getSidesetName(const std::string& originalName) {
+    auto it = customSidesetNames.find(originalName);
+    if (it != customSidesetNames.end() && !it->second.empty()) {
+        return it->second;
+    }
+    return originalName;
 }

@@ -1,0 +1,53 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Generated files
+*.o
+*.a
+*.so
+*.exe
+moc_*.cpp
+*_autogen/
+
+# Exodus and mesh files
+*.exo
+*.e
+*.ex2
+*.exodus
+
+# OpenFOAM files
+examples/
+*.foam
+
+# Distribution packages
+foam2exodus-distribution/
+foam2exodus-portable.tar.gz
+*.tar.gz
+*.zip
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+
+# Qt generated files
+*.qrc.depends
+*.moc
+ui_*.h
+qrc_*.cpp
+
+# Temporary files
+*.tmp
+*.log
+*.bak
