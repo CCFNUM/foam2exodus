@@ -6,6 +6,9 @@
 #include <netcdf.h>
 #include "OpenFOAMMeshReader.h"
 
+// Forward declaration for MergedMeshReader
+class MergedMeshReader;
+
 class ExodusWriter {
 public:
     ExodusWriter(const std::string& filename);
@@ -13,6 +16,12 @@ public:
 
     void writeMesh(const OpenFOAMMeshReader& reader);
     void writeMesh(const OpenFOAMMeshReader& reader,
+                   const std::map<std::string, std::string>& elementBlockNames,
+                   const std::map<std::string, std::string>& sidesetNames);
+
+    // Overloads for MergedMeshReader
+    void writeMesh(const MergedMeshReader& reader);
+    void writeMesh(const MergedMeshReader& reader,
                    const std::map<std::string, std::string>& elementBlockNames,
                    const std::map<std::string, std::string>& sidesetNames);
 
@@ -25,12 +34,23 @@ private:
     void initializeExodusFile(int numNodes, int numElems, int numElemBlocks,
                              int numNodeSets, int numSideSets);
     void writeNodes(const std::vector<Point>& points);
+
+    // Template method to work with any reader type (OpenFOAMMeshReader or MergedMeshReader)
+    template<typename ReaderType>
+    void writeElementsImpl(const ReaderType& reader);
+
+    template<typename ReaderType>
+    void writeSideSetsImpl(const ReaderType& reader);
+
     void writeElements(const OpenFOAMMeshReader& reader);
     void writeSideSets(const OpenFOAMMeshReader& reader);
+    void writeElements(const MergedMeshReader& reader);
+    void writeSideSets(const MergedMeshReader& reader);
+
     void checkError(int status, const std::string& message);
     std::string getBlockName(const std::string& originalName);
     std::string getSidesetName(const std::string& originalName);
-    std::vector<int> orderHexNodes(const Cell& cell, const std::vector<Face>& faces, 
+    std::vector<int> orderHexNodes(const Cell& cell, const std::vector<Face>& faces,
                                     const std::vector<Point>& points);
     std::vector<int> orderTetNodes(const Cell& cell, const std::vector<Face>& faces,
                                     const std::vector<Point>& points);

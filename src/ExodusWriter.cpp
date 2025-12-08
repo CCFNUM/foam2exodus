@@ -1,4 +1,5 @@
 #include "ExodusWriter.h"
+#include "MergedMeshReader.h"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -808,4 +809,384 @@ std::string ExodusWriter::getSidesetName(const std::string& originalName) {
         return it->second;
     }
     return originalName;
+}
+
+// MergedMeshReader overloads - delegate to template implementations
+void ExodusWriter::writeMesh(const MergedMeshReader& reader) {
+    customElementBlockNames.clear();
+    customSidesetNames.clear();
+
+    int numNodes = reader.getNumPoints();
+    int numElems = reader.getNumCells();
+    int numNodeSets = 0;
+    int numSideSets = reader.getNumBoundaryPatches();
+
+    const auto& cells = reader.getCells();
+    const auto& cellZones = reader.getCellZones();
+
+    int numElemBlocks = 0;
+    if (!cellZones.empty()) {
+        std::set<int> zonedCells;
+
+        for (const auto& zone : cellZones) {
+            std::set<std::string> typesInZone;
+            for (int cellIdx : zone.cellIndices) {
+                if (cellIdx < cells.size()) {
+                    typesInZone.insert(cells[cellIdx].type);
+                }
+            }
+            numElemBlocks += typesInZone.size();
+            for (int cellIdx : zone.cellIndices) {
+                zonedCells.insert(cellIdx);
+            }
+        }
+
+        std::set<std::string> unzonedTypes;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            if (zonedCells.find(i) == zonedCells.end()) {
+                unzonedTypes.insert(cells[i].type);
+            }
+        }
+        numElemBlocks += unzonedTypes.size();
+    } else {
+        std::set<std::string> types;
+        for (const auto& cell : cells) {
+            types.insert(cell.type);
+        }
+        numElemBlocks = types.size();
+    }
+
+    initializeExodusFile(numNodes, numElems, numElemBlocks, numNodeSets, numSideSets);
+
+    const auto& points = reader.getPoints();
+    writeNodes(points);
+
+    writeElements(reader);
+    writeSideSets(reader);
+
+    int status = nc_close(ncid);
+    checkError(status, "Failed to close Exodus file");
+    ncid = -1;
+}
+
+void ExodusWriter::writeMesh(const MergedMeshReader& reader,
+                             const std::map<std::string, std::string>& elementBlockNames,
+                             const std::map<std::string, std::string>& sidesetNames) {
+    customElementBlockNames = elementBlockNames;
+    customSidesetNames = sidesetNames;
+    writeMesh(reader);
+}
+
+void ExodusWriter::writeElements(const MergedMeshReader& reader) {
+    const auto& cells = reader.getCells();
+    const auto& faces = reader.getFaces();
+    const auto& points = reader.getPoints();
+    const auto& cellZones = reader.getCellZones();
+
+    nc_redef(ncid);
+
+    struct BlockInfo {
+        std::string name;
+        std::vector<int> cellIndices;
+        std::string cellType;
+    };
+
+    std::vector<BlockInfo> blocks;
+
+    if (!cellZones.empty() && cellZones.size() > 1) {
+        std::set<int> zonedCells;
+
+        for (const auto& zone : cellZones) {
+            std::map<std::string, std::vector<int>> zoneElemsByType;
+
+            for (int cellIdx : zone.cellIndices) {
+                if (cellIdx < cells.size()) {
+                    zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
+                    zonedCells.insert(cellIdx);
+                }
+            }
+
+            for (const auto& [cellType, cellIndices] : zoneElemsByType) {
+                BlockInfo block;
+                std::string originalName = zone.name + "-" + cellType;
+                block.name = getBlockName(originalName);
+                block.cellIndices = cellIndices;
+                block.cellType = cellType;
+                blocks.push_back(block);
+            }
+        }
+
+        std::map<std::string, std::vector<int>> unzonedElemsByType;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            if (zonedCells.find(i) == zonedCells.end()) {
+                unzonedElemsByType[cells[i].type].push_back(i);
+            }
+        }
+
+        for (const auto& [cellType, cellIndices] : unzonedElemsByType) {
+            BlockInfo block;
+            std::string originalName = "unzoned-" + cellType;
+            block.name = getBlockName(originalName);
+            block.cellIndices = cellIndices;
+            block.cellType = cellType;
+            blocks.push_back(block);
+        }
+    } else {
+        std::map<std::string, std::vector<int>> elemsByType;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            elemsByType[cells[i].type].push_back(i);
+        }
+
+        for (const auto& [cellType, cellIndices] : elemsByType) {
+            BlockInfo block;
+            std::string originalName = "fluid-" + cellType;
+            block.name = getBlockName(originalName);
+            block.cellIndices = cellIndices;
+            block.cellType = cellType;
+            blocks.push_back(block);
+        }
+    }
+
+    int blockId = 1;
+    for (const auto& block : blocks) {
+        int numElemsInBlock = block.cellIndices.size();
+
+        int numNodesPerElem = 8;
+        std::string exoType = "HEX8";
+
+        if (block.cellType == "tet") {
+            numNodesPerElem = 4;
+            exoType = "TETRA4";
+        } else if (block.cellType == "pyr") {
+            numNodesPerElem = 5;
+            exoType = "PYRAMID5";
+        } else if (block.cellType == "hex") {
+            numNodesPerElem = 8;
+            exoType = "HEX8";
+        }
+
+        int dim_num_el_in_blk, dim_num_nod_per_el;
+        std::string blk_num = std::to_string(blockId);
+
+        int status;
+        status = nc_def_dim(ncid, ("num_el_in_blk" + blk_num).c_str(), numElemsInBlock, &dim_num_el_in_blk);
+        checkError(status, "Failed to define element block dimension");
+
+        status = nc_def_dim(ncid, ("num_nod_per_el" + blk_num).c_str(), numNodesPerElem, &dim_num_nod_per_el);
+        checkError(status, "Failed to define nodes per element dimension");
+
+        int var_connect;
+        int dims_connect[2] = {dim_num_el_in_blk, dim_num_nod_per_el};
+        status = nc_def_var(ncid, ("connect" + blk_num).c_str(), NC_INT, 2, dims_connect, &var_connect);
+        checkError(status, "Failed to define connectivity variable");
+
+        status = nc_put_att_text(ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
+        checkError(status, "Failed to set element type attribute");
+
+        blockId++;
+    }
+
+    nc_enddef(ncid);
+
+    blockId = 1;
+    for (const auto& block : blocks) {
+        std::vector<int> connectivity;
+
+        for (int cellIdx : block.cellIndices) {
+            const auto& cell = cells[cellIdx];
+
+            std::vector<int> nodes;
+            if (block.cellType == "hex") {
+                nodes = orderHexNodes(cell, faces, points);
+            } else if (block.cellType == "tet") {
+                nodes = orderTetNodes(cell, faces, points);
+            } else if (block.cellType == "pyr") {
+                nodes = orderPyramidNodes(cell, faces, points);
+            } else {
+                std::set<int> nodeSet;
+                for (int faceIdx : cell.faceIndices) {
+                    if (faceIdx >= 0 && faceIdx < faces.size()) {
+                        for (int nodeIdx : faces[faceIdx].pointIndices) {
+                            nodeSet.insert(nodeIdx);
+                        }
+                    }
+                }
+                nodes.assign(nodeSet.begin(), nodeSet.end());
+            }
+
+            int numNodesPerElem = (block.cellType == "tet") ? 4 : (block.cellType == "pyr") ? 5 : 8;
+            for (int i = 0; i < numNodesPerElem; ++i) {
+                connectivity.push_back(i < nodes.size() ? nodes[i] + 1 : 1);
+            }
+        }
+
+        int var_id;
+        nc_inq_varid(ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
+        nc_put_var_int(ncid, var_id, connectivity.data());
+
+        int eb_status = 1;
+        int var_status;
+        nc_inq_varid(ncid, "eb_status", &var_status);
+        size_t index = blockId - 1;
+        nc_put_var1_int(ncid, var_status, &index, &eb_status);
+
+        int var_prop;
+        nc_inq_varid(ncid, "eb_prop1", &var_prop);
+        nc_put_var1_int(ncid, var_prop, &index, &blockId);
+
+        int var_eb_names;
+        nc_inq_varid(ncid, "eb_names", &var_eb_names);
+        char name_buffer[33];
+        memset(name_buffer, ' ', 33);
+        size_t copy_len = std::min(block.name.length(), (size_t)32);
+        memcpy(name_buffer, block.name.c_str(), copy_len);
+        name_buffer[32] = '\0';
+        size_t start[2] = {index, 0};
+        size_t count[2] = {1, 33};
+        nc_put_vara_text(ncid, var_eb_names, start, count, name_buffer);
+
+        std::cout << "Wrote element block " << blockId << " (" << block.name << ") with "
+                  << block.cellIndices.size() << " elements" << std::endl;
+
+        blockId++;
+    }
+}
+
+void ExodusWriter::writeSideSets(const MergedMeshReader& reader) {
+    const auto& patches = reader.getBoundaryPatches();
+    const auto& faces = reader.getFaces();
+    const auto& owner = reader.getOwner();
+    const auto& cells = reader.getCells();
+    const auto& points = reader.getPoints();
+
+    if (patches.empty()) {
+        std::cout << "No boundary patches to write as sidesets" << std::endl;
+        return;
+    }
+
+    std::map<int, std::vector<int>> cellToOrderedNodes;
+    for (size_t i = 0; i < cells.size(); ++i) {
+        const auto& cell = cells[i];
+        std::vector<int> orderedNodes;
+
+        if (cell.type == "hex") {
+            orderedNodes = orderHexNodes(cell, faces, points);
+        } else if (cell.type == "tet") {
+            orderedNodes = orderTetNodes(cell, faces, points);
+        } else if (cell.type == "pyr") {
+            orderedNodes = orderPyramidNodes(cell, faces, points);
+        } else {
+            std::set<int> nodeSet;
+            for (int faceIdx : cell.faceIndices) {
+                if (faceIdx >= 0 && faceIdx < faces.size()) {
+                    for (int nodeIdx : faces[faceIdx].pointIndices) {
+                        nodeSet.insert(nodeIdx);
+                    }
+                }
+            }
+            orderedNodes.assign(nodeSet.begin(), nodeSet.end());
+        }
+        cellToOrderedNodes[i] = orderedNodes;
+    }
+
+    nc_redef(ncid);
+
+    for (size_t i = 0; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        std::string ss_num = std::to_string(i + 1);
+
+        int dim_num_side_ss;
+        nc_def_dim(ncid, ("num_side_ss" + ss_num).c_str(), patch.nFaces, &dim_num_side_ss);
+
+        int var_elem_ss, var_side_ss;
+        nc_def_var(ncid, ("elem_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_elem_ss);
+        nc_def_var(ncid, ("side_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_side_ss);
+
+        std::string sidesetName = getSidesetName(patch.name);
+        nc_put_att_text(ncid, var_elem_ss, "name", sidesetName.length(), sidesetName.c_str());
+    }
+
+    int var_ss_names;
+    int dim_num_side_sets, dim_len_name;
+    int status;
+    status = nc_inq_dimid(ncid, "num_side_sets", &dim_num_side_sets);
+    checkError(status, "Failed to get num_side_sets dimension");
+
+    status = nc_inq_dimid(ncid, "len_name", &dim_len_name);
+    checkError(status, "Failed to get len_name dimension");
+
+    int dims_ss_names[2] = {dim_num_side_sets, dim_len_name};
+    status = nc_def_var(ncid, "ss_names", NC_CHAR, 2, dims_ss_names, &var_ss_names);
+    checkError(status, "Failed to define ss_names variable");
+
+    nc_enddef(ncid);
+
+    for (size_t i = 0; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        std::string ss_num = std::to_string(i + 1);
+
+        std::vector<int> elem_list, side_list;
+        elem_list.reserve(patch.nFaces);
+        side_list.reserve(patch.nFaces);
+
+        for (int j = 0; j < patch.nFaces; ++j) {
+            int faceIdx = patch.startFace + j;
+            if (faceIdx < owner.size()) {
+                int cellIdx = owner[faceIdx];
+                elem_list.push_back(cellIdx + 1);
+
+                const auto& face = faces[faceIdx];
+                const auto& cell = cells[cellIdx];
+                int sideId = 1;
+
+                if (cell.type == "hex" && cellToOrderedNodes.count(cellIdx)) {
+                    sideId = getHexFaceId(face.pointIndices, cellToOrderedNodes[cellIdx]);
+                }
+
+                side_list.push_back(sideId);
+            }
+        }
+
+        int var_id;
+        nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
+        nc_put_var_int(ncid, var_id, elem_list.data());
+
+        nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
+        nc_put_var_int(ncid, var_id, side_list.data());
+
+        int ss_status = 1;
+        int var_status;
+        nc_inq_varid(ncid, "ss_status", &var_status);
+        size_t index = i;
+        nc_put_var1_int(ncid, var_status, &index, &ss_status);
+
+        int ss_id = i + 1;
+        int var_prop;
+        nc_inq_varid(ncid, "ss_prop1", &var_prop);
+        nc_put_var1_int(ncid, var_prop, &index, &ss_id);
+
+        std::string sidesetName = getSidesetName(patch.name);
+        char name_padded[33];
+        std::memset(name_padded, 0, 33);
+        std::strncpy(name_padded, sidesetName.c_str(), 32);
+
+        nc_inq_varid(ncid, "ss_names", &var_id);
+        size_t start[2] = {i, 0};
+        size_t count[2] = {1, 33};
+        nc_put_vara_text(ncid, var_id, start, count, name_padded);
+
+        std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
+                  << " with " << patch.nFaces << " faces" << std::endl;
+    }
+}
+
+// Template implementations (kept in header for inlining)
+template<typename ReaderType>
+void ExodusWriter::writeElementsImpl(const ReaderType& reader) {
+    // This is just a placeholder - actual implementation is in the concrete overloads above
+}
+
+template<typename ReaderType>
+void ExodusWriter::writeSideSetsImpl(const ReaderType& reader) {
+    // This is just a placeholder - actual implementation is in the concrete overloads above
 }

@@ -28,17 +28,18 @@ add_executable(foam2Exodus
     main.cpp
     src/OpenFOAMMeshReader.cpp
     src/ExodusWriter.cpp
+    src/MergedMeshReader.cpp
 )
 
 target_link_libraries(foam2Exodus ${NETCDF_LIBRARIES})
 
 install(TARGETS foam2Exodus DESTINATION bin)
 
-# GUI executable (optional, only if Qt5 is found)
+# GUI executable (optional, only if Qt5 and GUI sources are found)
 find_package(Qt5 COMPONENTS Widgets QUIET)
 
-if(Qt5_FOUND)
-    message(STATUS "Qt5 found, building GUI application")
+if(Qt5_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/main_gui.cpp")
+    message(STATUS "Qt5 and GUI sources found, building GUI application")
 
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTORCC ON)
@@ -48,7 +49,8 @@ if(Qt5_FOUND)
         src/main_gui.cpp
         src/MainWindow.cpp
         src/OpenFOAMMeshReader.cpp
-        src/ExodusWriter.cpp)
+        src/ExodusWriter.cpp
+        src/MergedMeshReader.cpp)
 
     target_link_libraries(foam2ExodusGUI
         ${NETCDF_LIBRARIES}
@@ -56,9 +58,13 @@ if(Qt5_FOUND)
 
     install(TARGETS foam2ExodusGUI DESTINATION bin)
 else()
-    message(STATUS "Qt5 not found, skipping GUI application build")
-    message(STATUS "Install Qt5 development packages to build the GUI:")
-    message(STATUS "  Ubuntu/Debian: sudo apt install qtbase5-dev")
-    message(STATUS "  Fedora/RHEL: sudo dnf install qt5-qtbase-devel")
-    message(STATUS "  Arch: sudo pacman -S qt5-base")
+    if(NOT Qt5_FOUND)
+        message(STATUS "Qt5 not found, skipping GUI application build")
+        message(STATUS "Install Qt5 development packages to build the GUI:")
+        message(STATUS "  Ubuntu/Debian: sudo apt install qtbase5-dev")
+        message(STATUS "  Fedora/RHEL: sudo dnf install qt5-qtbase-devel")
+        message(STATUS "  Arch: sudo pacman -S qt5-base")
+    else()
+        message(STATUS "GUI source files not found, skipping GUI application build")
+    endif()
 endif()
