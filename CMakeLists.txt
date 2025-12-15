@@ -15,7 +15,37 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(NETCDF REQUIRED netcdf)
+
+# NetCDF configuration
+if(DEFINED NETCDF_DIR)
+    # Use custom NetCDF path
+    message(STATUS "Using custom NetCDF path: ${NETCDF_DIR}")
+    set(NETCDF_INCLUDE_DIRS "${NETCDF_DIR}/include")
+    set(NETCDF_LIBRARY_DIRS "${NETCDF_DIR}/lib")
+    set(NETCDF_BIN_DIR "${NETCDF_DIR}/bin")
+
+    # Find the netcdf library
+    find_library(NETCDF_LIBRARY
+        NAMES netcdf
+        PATHS ${NETCDF_LIBRARY_DIRS}
+        NO_DEFAULT_PATH
+    )
+
+    if(NETCDF_LIBRARY)
+        set(NETCDF_LIBRARIES ${NETCDF_LIBRARY})
+        set(NETCDF_FOUND TRUE)
+        link_directories(${NETCDF_LIBRARY_DIRS})
+        message(STATUS "Found NetCDF library: ${NETCDF_LIBRARY}")
+        message(STATUS "NetCDF include dir: ${NETCDF_INCLUDE_DIRS}")
+        message(STATUS "NetCDF library dir: ${NETCDF_LIBRARY_DIRS}")
+        message(STATUS "NetCDF bin dir: ${NETCDF_BIN_DIR}")
+    else()
+        message(FATAL_ERROR "NetCDF library not found in ${NETCDF_DIR}/lib")
+    endif()
+else()
+    # Use pkg-config to find NetCDF (standard behavior)
+    pkg_check_modules(NETCDF REQUIRED netcdf)
+endif()
 
 include_directories(${NETCDF_INCLUDE_DIRS})
 
@@ -36,7 +66,15 @@ target_link_libraries(foam2Exodus ${NETCDF_LIBRARIES})
 install(TARGETS foam2Exodus DESTINATION bin)
 
 # GUI executable (optional, only if Qt5 and GUI sources are found)
-find_package(Qt5 COMPONENTS Widgets QUIET)
+if(DEFINED QT5_DIR)
+    # Use custom Qt5 path
+    message(STATUS "Using custom Qt5 path: ${QT5_DIR}")
+    set(CMAKE_PREFIX_PATH "${QT5_DIR}")
+    find_package(Qt5 COMPONENTS Widgets QUIET)
+else()
+    # Use standard Qt5 detection
+    find_package(Qt5 COMPONENTS Widgets QUIET)
+endif()
 
 if(Qt5_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/main_gui.cpp")
     message(STATUS "Qt5 and GUI sources found, building GUI application")
