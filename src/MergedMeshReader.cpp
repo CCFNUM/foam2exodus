@@ -143,12 +143,11 @@ void MergedMeshReader::mergeBoundaryPatches() {
         }
     }
     if (hasDuplicates) {
-        std::cout << "  → Only duplicate names will be prefixed with mesh name" << std::endl;
+        std::cout << "  → All boundaries prefixed with mesh name to ensure uniqueness" << std::endl;
         std::cout << std::endl;
     }
 
-    // Merge boundary patches with face offset
-    // Only prefix names that have duplicates across meshes
+    // Merge boundary patches with unique naming and face offset
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         const auto& patches = readers[meshIdx]->getBoundaryPatches();
         int faceOffset = offsets[meshIdx].faceOffset;
@@ -157,12 +156,8 @@ void MergedMeshReader::mergeBoundaryPatches() {
         for (const auto& patch : patches) {
             BoundaryPatch offsetPatch;
 
-            // Only prefix if this name exists in multiple meshes
-            if (originalNameToMeshes[patch.name].size() > 1) {
-                offsetPatch.name = meshPrefix + "_" + patch.name;
-            } else {
-                offsetPatch.name = patch.name;
-            }
+            // Create unique name for this patch
+            offsetPatch.name = meshPrefix + "_" + patch.name;
             offsetPatch.type = patch.type;
             offsetPatch.startFace = patch.startFace + faceOffset;
             offsetPatch.nFaces = patch.nFaces;
@@ -180,20 +175,12 @@ void MergedMeshReader::mergeCellZones() {
     std::map<std::string, std::vector<std::string>> originalZoneNameToMeshes;
 
     // First pass: collect all zone names and their source meshes
-    // Also count meshes with no zones (they will get "default" zone)
-    int meshesWithNoZones = 0;
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         const auto& zones = readers[meshIdx]->getCellZones();
         std::string meshPrefix = getMeshPrefix(meshIdx);
 
-        if (zones.empty()) {
-            // This mesh will get a "default" zone
-            originalZoneNameToMeshes["default"].push_back(meshPrefix);
-            meshesWithNoZones++;
-        } else {
-            for (const auto& zone : zones) {
-                originalZoneNameToMeshes[zone.name].push_back(meshPrefix);
-            }
+        for (const auto& zone : zones) {
+            originalZoneNameToMeshes[zone.name].push_back(meshPrefix);
         }
     }
 
@@ -214,12 +201,11 @@ void MergedMeshReader::mergeCellZones() {
         }
     }
     if (hasDuplicates) {
-        std::cout << "  → Only duplicate names will be prefixed with mesh name" << std::endl;
+        std::cout << "  → All zones prefixed with mesh name to ensure unique element blocks" << std::endl;
         std::cout << std::endl;
     }
 
-    // Merge cell zones with cell index offsetting
-    // Only prefix names that have duplicates across meshes
+    // Merge cell zones with unique naming and cell index offsetting
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         const auto& zones = readers[meshIdx]->getCellZones();
         int cellOffset = offsets[meshIdx].cellOffset;
@@ -228,12 +214,8 @@ void MergedMeshReader::mergeCellZones() {
         for (const auto& zone : zones) {
             CellZone offsetZone;
 
-            // Only prefix if this name exists in multiple meshes
-            if (originalZoneNameToMeshes[zone.name].size() > 1) {
-                offsetZone.name = meshPrefix + "_" + zone.name;
-            } else {
-                offsetZone.name = zone.name;
-            }
+            // Create unique name for this zone
+            offsetZone.name = meshPrefix + "_" + zone.name;
             offsetZone.cellIndices.reserve(zone.cellIndices.size());
 
             // Apply cell offset to all cell indices
@@ -244,26 +226,19 @@ void MergedMeshReader::mergeCellZones() {
             mergedCellZones.push_back(offsetZone);
 
             // Add to element block naming map
+            // The ExodusWriter creates element blocks based on zone names and element types
+            // We need to ensure each mesh's zones produce distinct element blocks
             elementBlockNames[offsetZone.name] = offsetZone.name;
         }
     }
 
     // If any mesh has no cell zones, create a default zone for it
-    // Only prefix "default" if multiple meshes have no zones
-    bool prefixDefault = (meshesWithNoZones > 1) ||
-                         (originalZoneNameToMeshes.count("default") > 0 &&
-                          originalZoneNameToMeshes["default"].size() > 1);
-
+    // This ensures cells from different meshes don't get merged into the same default zone
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         if (readers[meshIdx]->getNumCellZones() == 0) {
             std::string meshPrefix = getMeshPrefix(meshIdx);
             CellZone defaultZone;
-
-            if (prefixDefault) {
-                defaultZone.name = meshPrefix + "_default";
-            } else {
-                defaultZone.name = "default";
-            }
+            defaultZone.name = meshPrefix + "_default";
 
             // Add all cells from this mesh to the default zone
             int cellOffset = offsets[meshIdx].cellOffset;
