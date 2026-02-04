@@ -143,11 +143,12 @@ void MergedMeshReader::mergeBoundaryPatches() {
         }
     }
     if (hasDuplicates) {
-        std::cout << "  → All boundaries prefixed with mesh name to ensure uniqueness" << std::endl;
+        std::cout << "  → Only duplicate names will be prefixed with mesh name" << std::endl;
         std::cout << std::endl;
     }
 
-    // Merge boundary patches with unique naming and face offset
+    // Merge boundary patches with face offset
+    // Only prefix names that have duplicates across meshes
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         const auto& patches = readers[meshIdx]->getBoundaryPatches();
         int faceOffset = offsets[meshIdx].faceOffset;
@@ -156,8 +157,12 @@ void MergedMeshReader::mergeBoundaryPatches() {
         for (const auto& patch : patches) {
             BoundaryPatch offsetPatch;
 
-            // Create unique name for this patch
-            offsetPatch.name = meshPrefix + "_" + patch.name;
+            // Only prefix if this name exists in multiple meshes
+            if (originalNameToMeshes[patch.name].size() > 1) {
+                offsetPatch.name = meshPrefix + "_" + patch.name;
+            } else {
+                offsetPatch.name = patch.name;
+            }
             offsetPatch.type = patch.type;
             offsetPatch.startFace = patch.startFace + faceOffset;
             offsetPatch.nFaces = patch.nFaces;
@@ -232,13 +237,12 @@ void MergedMeshReader::mergeCellZones() {
         }
     }
 
-    // If any mesh has no cell zones, create a default zone for it
-    // This ensures cells from different meshes don't get merged into the same default zone
+    // If any mesh has no cell zones, create a zone named after the case
     for (size_t meshIdx = 0; meshIdx < readers.size(); ++meshIdx) {
         if (readers[meshIdx]->getNumCellZones() == 0) {
             std::string meshPrefix = getMeshPrefix(meshIdx);
             CellZone defaultZone;
-            defaultZone.name = meshPrefix + "_default";
+            defaultZone.name = meshPrefix;
 
             // Add all cells from this mesh to the default zone
             int cellOffset = offsets[meshIdx].cellOffset;
