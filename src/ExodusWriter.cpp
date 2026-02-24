@@ -196,7 +196,20 @@ std::vector<int> ExodusWriter::orderTetNodes(const Cell& cell, const std::vector
     orderedNodes[1] = face0[1];
     orderedNodes[2] = face0[2];
     orderedNodes[3] = apexNode;
-    
+
+    // Ensure positive orientation: scalar triple product (p1-p0)·((p2-p0)×(p3-p0)) > 0
+    const Point& p0 = points[orderedNodes[0]];
+    const Point& p1 = points[orderedNodes[1]];
+    const Point& p2 = points[orderedNodes[2]];
+    const Point& p3 = points[orderedNodes[3]];
+    double v1x = p1.x-p0.x, v1y = p1.y-p0.y, v1z = p1.z-p0.z;
+    double v2x = p2.x-p0.x, v2y = p2.y-p0.y, v2z = p2.z-p0.z;
+    double v3x = p3.x-p0.x, v3y = p3.y-p0.y, v3z = p3.z-p0.z;
+    double vol = v1x*(v2y*v3z - v2z*v3y) + v1y*(v2z*v3x - v2x*v3z) + v1z*(v2x*v3y - v2y*v3x);
+    if (vol < 0) {
+        std::swap(orderedNodes[1], orderedNodes[2]);
+    }
+
     return orderedNodes;
 }
 
@@ -254,7 +267,26 @@ std::vector<int> ExodusWriter::orderPyramidNodes(const Cell& cell, const std::ve
     orderedNodes[2] = quadFace[2];
     orderedNodes[3] = quadFace[3];
     orderedNodes[4] = apexNode;
-    
+
+    // Ensure positive orientation: the cross product of two base-quad edges crossed with
+    // the vector to apex should be positive (apex is on the positive-normal side of the base).
+    const Point& p0 = points[orderedNodes[0]];
+    const Point& p1 = points[orderedNodes[1]];
+    const Point& p3 = points[orderedNodes[3]];
+    const Point& p4 = points[orderedNodes[4]];
+    // Base-quad normal: (p1-p0) x (p3-p0)
+    double v1x = p1.x-p0.x, v1y = p1.y-p0.y, v1z = p1.z-p0.z;
+    double v2x = p3.x-p0.x, v2y = p3.y-p0.y, v2z = p3.z-p0.z;
+    double nx = v1y*v2z - v1z*v2y;
+    double ny = v1z*v2x - v1x*v2z;
+    double nz = v1x*v2y - v1y*v2x;
+    // Vector from p0 to apex
+    double ax = p4.x-p0.x, ay = p4.y-p0.y, az = p4.z-p0.z;
+    // dot(normal, apex_vec) should be positive
+    if (nx*ax + ny*ay + nz*az < 0) {
+        std::swap(orderedNodes[1], orderedNodes[3]);
+    }
+
     return orderedNodes;
 }
 
@@ -282,25 +314,37 @@ std::vector<int> ExodusWriter::orderHexNodes(const Cell& cell, const std::vector
         return std::vector<int>(nodeSet.begin(), nodeSet.end());
     }
     
-    std::vector<int> bottomFace = quadFaces[0];
+    // Pick bottom face as the one with minimum mean Z centroid so that
+    // all elements use the same geometric face as "bottom" regardless of
+    // the arbitrary face-index order in the OpenFOAM cell's face list.
+    int bottomIdx = 0;
+    double minZ = 1e30;
+    for (int i = 0; i < (int)quadFaces.size(); ++i) {
+        double z = 0.0;
+        for (int n : quadFaces[i]) z += points[n].z;
+        z /= 4.0;
+        if (z < minZ) { minZ = z; bottomIdx = i; }
+    }
+    std::vector<int> bottomFace = quadFaces[bottomIdx];
     std::set<int> bottomSet(bottomFace.begin(), bottomFace.end());
     
     std::vector<int> topFace;
     int topFaceIdx = -1;
-    for (size_t i = 1; i < quadFaces.size(); ++i) {
+    for (size_t i = 0; i < quadFaces.size(); ++i) {
+        if ((int)i == bottomIdx) continue;
         std::set<int> faceSet(quadFaces[i].begin(), quadFaces[i].end());
         std::vector<int> intersection;
         std::set_intersection(bottomSet.begin(), bottomSet.end(),
                             faceSet.begin(), faceSet.end(),
                             std::back_inserter(intersection));
-        
+
         if (intersection.empty()) {
             topFace = quadFaces[i];
             topFaceIdx = i;
             break;
         }
     }
-    
+
     if (topFace.empty()) {
         std::set<int> nodeSet;
         for (const auto& face : quadFaces) {
@@ -308,10 +352,10 @@ std::vector<int> ExodusWriter::orderHexNodes(const Cell& cell, const std::vector
         }
         return std::vector<int>(nodeSet.begin(), nodeSet.end());
     }
-    
+
     std::vector<std::vector<int>> sideFaces;
-    for (size_t i = 1; i < quadFaces.size(); ++i) {
-        if (i != topFaceIdx) {
+    for (size_t i = 0; i < quadFaces.size(); ++i) {
+        if ((int)i != bottomIdx && (int)i != topFaceIdx) {
             sideFaces.push_back(quadFaces[i]);
         }
     }
@@ -488,48 +532,51 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
         
         int numNodesPerElem = 8;
         std::string exoType = "HEX8";
-        
+
         if (block.cellType == "tet") {
             numNodesPerElem = 4;
             exoType = "TETRA4";
         } else if (block.cellType == "pyr") {
             numNodesPerElem = 5;
             exoType = "PYRAMID5";
+        } else if (block.cellType == "wedge") {
+            numNodesPerElem = 6;
+            exoType = "WEDGE6";
         } else if (block.cellType == "hex") {
             numNodesPerElem = 8;
             exoType = "HEX8";
         }
-        
+
         int dim_num_el_in_blk, dim_num_nod_per_el;
         std::string blk_num = std::to_string(blockId);
-        
+
         int status;
         status = nc_def_dim(ncid, ("num_el_in_blk" + blk_num).c_str(), numElemsInBlock, &dim_num_el_in_blk);
         checkError(status, "Failed to define element block dimension");
-        
+
         status = nc_def_dim(ncid, ("num_nod_per_el" + blk_num).c_str(), numNodesPerElem, &dim_num_nod_per_el);
         checkError(status, "Failed to define nodes per element dimension");
-        
+
         int var_connect;
         int dims_connect[2] = {dim_num_el_in_blk, dim_num_nod_per_el};
         status = nc_def_var(ncid, ("connect" + blk_num).c_str(), NC_INT, 2, dims_connect, &var_connect);
         checkError(status, "Failed to define connectivity variable");
-        
+
         status = nc_put_att_text(ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
         checkError(status, "Failed to set element type attribute");
-        
+
         blockId++;
     }
-    
+
     nc_enddef(ncid);
-    
+
     blockId = 1;
     for (const auto& block : blocks) {
         std::vector<int> connectivity;
-        
+
         for (int cellIdx : block.cellIndices) {
             const auto& cell = cells[cellIdx];
-            
+
             std::vector<int> nodes;
             if (block.cellType == "hex") {
                 nodes = orderHexNodes(cell, faces, points);
@@ -537,10 +584,12 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
                 nodes = orderTetNodes(cell, faces, points);
             } else if (block.cellType == "pyr") {
                 nodes = orderPyramidNodes(cell, faces, points);
+            } else if (block.cellType == "wedge") {
+                nodes = orderWedgeNodes(cell, faces, points);
             } else {
                 std::set<int> nodeSet;
                 for (int faceIdx : cell.faceIndices) {
-                    if (faceIdx >= 0 && faceIdx < faces.size()) {
+                    if (faceIdx >= 0 && faceIdx < (int)faces.size()) {
                         for (int nodeIdx : faces[faceIdx].pointIndices) {
                             nodeSet.insert(nodeIdx);
                         }
@@ -548,13 +597,20 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
                 }
                 nodes.assign(nodeSet.begin(), nodeSet.end());
             }
-            
-            int numNodesPerElem = (block.cellType == "tet") ? 4 : (block.cellType == "pyr") ? 5 : 8;
+
+            int numNodesPerElem = (block.cellType == "tet")   ? 4 :
+                                  (block.cellType == "pyr")   ? 5 :
+                                  (block.cellType == "wedge") ? 6 : 8;
+            if ((int)nodes.size() != numNodesPerElem) {
+                std::cerr << "Warning: cell " << cellIdx << " (type=" << block.cellType
+                          << ") returned " << nodes.size() << " nodes, expected "
+                          << numNodesPerElem << std::endl;
+            }
             for (int i = 0; i < numNodesPerElem; ++i) {
-                connectivity.push_back(i < nodes.size() ? nodes[i] + 1 : 1);
+                connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1 : 1);
             }
         }
-        
+
         int var_id;
         nc_inq_varid(ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, connectivity.data());
@@ -587,9 +643,121 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader) {
     }
 }
 
+std::vector<int> ExodusWriter::orderWedgeNodes(const Cell& cell, const std::vector<Face>& faces,
+                                                const std::vector<Point>& points) {
+    if (cell.faceIndices.size() < 5) {
+        return std::vector<int>(6, 0);
+    }
+
+    std::vector<int> triFaceIndices;
+    std::vector<int> quadFaceIndices;
+    for (int faceIdx : cell.faceIndices) {
+        if (faceIdx >= 0 && faceIdx < (int)faces.size()) {
+            int nPts = faces[faceIdx].pointIndices.size();
+            if (nPts == 3) triFaceIndices.push_back(faceIdx);
+            else if (nPts == 4) quadFaceIndices.push_back(faceIdx);
+        }
+    }
+
+    if (triFaceIndices.size() != 2 || quadFaceIndices.size() != 3) {
+        std::set<int> nodeSet;
+        for (int fi : cell.faceIndices) {
+            if (fi >= 0 && fi < (int)faces.size())
+                for (int n : faces[fi].pointIndices) nodeSet.insert(n);
+        }
+        std::vector<int> nodes(nodeSet.begin(), nodeSet.end());
+        nodes.resize(6, 0);
+        return nodes;
+    }
+
+    // Pick the tri face with lower mean-Z as "bottom" for consistent orientation
+    auto triCentroidZ = [&](int fi) {
+        double z = 0.0;
+        for (int n : faces[fi].pointIndices) z += points[n].z;
+        return z / 3.0;
+    };
+    int bottomTriIdx = (triCentroidZ(triFaceIndices[0]) <= triCentroidZ(triFaceIndices[1]))
+                       ? triFaceIndices[0] : triFaceIndices[1];
+    int topTriIdx    = (bottomTriIdx == triFaceIndices[0]) ? triFaceIndices[1] : triFaceIndices[0];
+
+    const std::vector<int>& bottomFace = faces[bottomTriIdx].pointIndices;
+    const std::vector<int>& topFace    = faces[topTriIdx].pointIndices;
+
+    std::vector<int> orderedNodes(6);
+    orderedNodes[0] = bottomFace[0];
+    orderedNodes[1] = bottomFace[1];
+    orderedNodes[2] = bottomFace[2];
+
+    // Map each bottom node to its corresponding top node via shared quad side faces
+    for (int i = 0; i < 3; ++i) {
+        int n0 = bottomFace[i];
+        int n1 = bottomFace[(i + 1) % 3];
+
+        int topNode = -1;
+        for (int qfi : quadFaceIndices) {
+            const auto& qf = faces[qfi].pointIndices;
+            int n0Idx = -1, n1Idx = -1;
+            for (int j = 0; j < 4; ++j) {
+                if (qf[j] == n0) n0Idx = j;
+                if (qf[j] == n1) n1Idx = j;
+            }
+            if (n0Idx >= 0 && n1Idx >= 0) {
+                int nextIdx = (n0Idx + 1) % 4;
+                int prevIdx = (n0Idx + 3) % 4;
+                int candidate = -1;
+                if      (nextIdx == n1Idx) candidate = qf[prevIdx];
+                else if (prevIdx == n1Idx) candidate = qf[nextIdx];
+                if (candidate != -1) {
+                    auto it = std::find(topFace.begin(), topFace.end(), candidate);
+                    if (it != topFace.end()) { topNode = candidate; break; }
+                }
+            }
+        }
+
+        if (topNode == -1) {
+            // Fallback: nearest unused top node to n0
+            double minDist = 1e30;
+            for (int node : topFace) {
+                bool used = false;
+                for (int j = 0; j < i; ++j) if (orderedNodes[3+j] == node) { used = true; break; }
+                if (!used) {
+                    const Point& pb = points[n0];
+                    const Point& pt = points[node];
+                    double dist = (pt.x-pb.x)*(pt.x-pb.x)+(pt.y-pb.y)*(pt.y-pb.y)+(pt.z-pb.z)*(pt.z-pb.z);
+                    if (dist < minDist) { minDist = dist; topNode = node; }
+                }
+            }
+        }
+        orderedNodes[3 + i] = (topNode != -1) ? topNode : topFace[i];
+    }
+
+    // Orientation check: normal of bottom triangle should point toward top nodes.
+    // n = (p1-p0) x (p2-p0);  h = centroid(top) - centroid(bottom)
+    const Point& p0 = points[orderedNodes[0]];
+    const Point& p1 = points[orderedNodes[1]];
+    const Point& p2 = points[orderedNodes[2]];
+    const Point& p3 = points[orderedNodes[3]];
+    const Point& p4 = points[orderedNodes[4]];
+    const Point& p5 = points[orderedNodes[5]];
+    double v1x = p1.x-p0.x, v1y = p1.y-p0.y, v1z = p1.z-p0.z;
+    double v2x = p2.x-p0.x, v2y = p2.y-p0.y, v2z = p2.z-p0.z;
+    double nx = v1y*v2z - v1z*v2y;
+    double ny = v1z*v2x - v1x*v2z;
+    double nz = v1x*v2y - v1y*v2x;
+    double hx = (p3.x+p4.x+p5.x)/3.0 - (p0.x+p1.x+p2.x)/3.0;
+    double hy = (p3.y+p4.y+p5.y)/3.0 - (p0.y+p1.y+p2.y)/3.0;
+    double hz = (p3.z+p4.z+p5.z)/3.0 - (p0.z+p1.z+p2.z)/3.0;
+    if (nx*hx + ny*hy + nz*hz < 0) {
+        std::swap(orderedNodes[1], orderedNodes[2]);
+        std::swap(orderedNodes[4], orderedNodes[5]);
+    }
+
+    return orderedNodes;
+}
+
 int ExodusWriter::getHexFaceId(const std::vector<int>& faceNodes, const std::vector<int>& hexNodes) {
     std::set<int> faceSet(faceNodes.begin(), faceNodes.end());
-    
+
     std::vector<std::vector<int>> hexFaces = {
         {hexNodes[0], hexNodes[1], hexNodes[5], hexNodes[4]},
         {hexNodes[1], hexNodes[2], hexNodes[6], hexNodes[5]},
@@ -598,14 +766,64 @@ int ExodusWriter::getHexFaceId(const std::vector<int>& faceNodes, const std::vec
         {hexNodes[0], hexNodes[3], hexNodes[2], hexNodes[1]},
         {hexNodes[4], hexNodes[5], hexNodes[6], hexNodes[7]}
     };
-    
+
     for (int i = 0; i < 6; ++i) {
         std::set<int> hexFaceSet(hexFaces[i].begin(), hexFaces[i].end());
         if (faceSet == hexFaceSet) {
             return i + 1;
         }
     }
-    
+
+    return 1;
+}
+
+int ExodusWriter::getTetFaceId(const std::vector<int>& faceNodes, const std::vector<int>& tetNodes) {
+    std::set<int> faceSet(faceNodes.begin(), faceNodes.end());
+    // Exodus II TETRA4 face ordering
+    std::vector<std::vector<int>> tetFaces = {
+        {tetNodes[0], tetNodes[1], tetNodes[3]},
+        {tetNodes[1], tetNodes[2], tetNodes[3]},
+        {tetNodes[2], tetNodes[0], tetNodes[3]},
+        {tetNodes[0], tetNodes[2], tetNodes[1]}
+    };
+    for (int i = 0; i < 4; ++i) {
+        std::set<int> fs(tetFaces[i].begin(), tetFaces[i].end());
+        if (faceSet == fs) return i + 1;
+    }
+    return 1;
+}
+
+int ExodusWriter::getPyramidFaceId(const std::vector<int>& faceNodes, const std::vector<int>& pyrNodes) {
+    std::set<int> faceSet(faceNodes.begin(), faceNodes.end());
+    // Exodus II PYRAMID5 face ordering
+    std::vector<std::vector<int>> pyrFaces = {
+        {pyrNodes[0], pyrNodes[1], pyrNodes[4]},
+        {pyrNodes[1], pyrNodes[2], pyrNodes[4]},
+        {pyrNodes[2], pyrNodes[3], pyrNodes[4]},
+        {pyrNodes[3], pyrNodes[0], pyrNodes[4]},
+        {pyrNodes[0], pyrNodes[3], pyrNodes[2], pyrNodes[1]}
+    };
+    for (int i = 0; i < 5; ++i) {
+        std::set<int> fs(pyrFaces[i].begin(), pyrFaces[i].end());
+        if (faceSet == fs) return i + 1;
+    }
+    return 1;
+}
+
+int ExodusWriter::getWedgeFaceId(const std::vector<int>& faceNodes, const std::vector<int>& wedgeNodes) {
+    std::set<int> faceSet(faceNodes.begin(), faceNodes.end());
+    // Exodus II WEDGE6 face ordering
+    std::vector<std::vector<int>> wedgeFaces = {
+        {wedgeNodes[0], wedgeNodes[1], wedgeNodes[4], wedgeNodes[3]},
+        {wedgeNodes[1], wedgeNodes[2], wedgeNodes[5], wedgeNodes[4]},
+        {wedgeNodes[2], wedgeNodes[0], wedgeNodes[3], wedgeNodes[5]},
+        {wedgeNodes[0], wedgeNodes[2], wedgeNodes[1]},
+        {wedgeNodes[3], wedgeNodes[4], wedgeNodes[5]}
+    };
+    for (int i = 0; i < 5; ++i) {
+        std::set<int> fs(wedgeFaces[i].begin(), wedgeFaces[i].end());
+        if (faceSet == fs) return i + 1;
+    }
     return 1;
 }
 
@@ -625,17 +843,19 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader) {
     for (size_t i = 0; i < cells.size(); ++i) {
         const auto& cell = cells[i];
         std::vector<int> orderedNodes;
-        
+
         if (cell.type == "hex") {
             orderedNodes = orderHexNodes(cell, faces, points);
         } else if (cell.type == "tet") {
             orderedNodes = orderTetNodes(cell, faces, points);
         } else if (cell.type == "pyr") {
             orderedNodes = orderPyramidNodes(cell, faces, points);
+        } else if (cell.type == "wedge") {
+            orderedNodes = orderWedgeNodes(cell, faces, points);
         } else {
             std::set<int> nodeSet;
             for (int faceIdx : cell.faceIndices) {
-                if (faceIdx >= 0 && faceIdx < faces.size()) {
+                if (faceIdx >= 0 && faceIdx < (int)faces.size()) {
                     for (int nodeIdx : faces[faceIdx].pointIndices) {
                         nodeSet.insert(nodeIdx);
                     }
@@ -645,16 +865,16 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader) {
         }
         cellToOrderedNodes[i] = orderedNodes;
     }
-    
+
     nc_redef(ncid);
-    
+
     for (size_t i = 0; i < patches.size(); ++i) {
         const auto& patch = patches[i];
         std::string ss_num = std::to_string(i + 1);
-        
+
         int dim_num_side_ss;
         nc_def_dim(ncid, ("num_side_ss" + ss_num).c_str(), patch.nFaces, &dim_num_side_ss);
-        
+
         int var_elem_ss, var_side_ss;
         nc_def_var(ncid, ("elem_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_elem_ss);
         nc_def_var(ncid, ("side_ss" + ss_num).c_str(), NC_INT, 1, &dim_num_side_ss, &var_side_ss);
@@ -695,28 +915,36 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader) {
                 const auto& face = faces[faceIdx];
                 const auto& cell = cells[cellIdx];
                 int sideId = 1;
-                
-                if (cell.type == "hex" && cellToOrderedNodes.count(cellIdx)) {
-                    sideId = getHexFaceId(face.pointIndices, cellToOrderedNodes[cellIdx]);
+
+                if (cellToOrderedNodes.count(cellIdx)) {
+                    const auto& ordNodes = cellToOrderedNodes[cellIdx];
+                    if (cell.type == "hex")
+                        sideId = getHexFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "tet")
+                        sideId = getTetFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "pyr")
+                        sideId = getPyramidFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "wedge")
+                        sideId = getWedgeFaceId(face.pointIndices, ordNodes);
                 }
-                
+
                 side_list.push_back(sideId);
             }
         }
-        
+
         int var_id;
         nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, elem_list.data());
-        
+
         nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, side_list.data());
-        
+
         int ss_status = 1;
         int var_status;
         nc_inq_varid(ncid, "ss_status", &var_status);
         size_t index = i;
         nc_put_var1_int(ncid, var_status, &index, &ss_status);
-        
+
         int ss_id = i + 1;
         int var_prop;
         nc_inq_varid(ncid, "ss_prop1", &var_prop);
@@ -960,6 +1188,9 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader) {
         } else if (block.cellType == "pyr") {
             numNodesPerElem = 5;
             exoType = "PYRAMID5";
+        } else if (block.cellType == "wedge") {
+            numNodesPerElem = 6;
+            exoType = "WEDGE6";
         } else if (block.cellType == "hex") {
             numNodesPerElem = 8;
             exoType = "HEX8";
@@ -1002,10 +1233,12 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader) {
                 nodes = orderTetNodes(cell, faces, points);
             } else if (block.cellType == "pyr") {
                 nodes = orderPyramidNodes(cell, faces, points);
+            } else if (block.cellType == "wedge") {
+                nodes = orderWedgeNodes(cell, faces, points);
             } else {
                 std::set<int> nodeSet;
                 for (int faceIdx : cell.faceIndices) {
-                    if (faceIdx >= 0 && faceIdx < faces.size()) {
+                    if (faceIdx >= 0 && faceIdx < (int)faces.size()) {
                         for (int nodeIdx : faces[faceIdx].pointIndices) {
                             nodeSet.insert(nodeIdx);
                         }
@@ -1014,9 +1247,16 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader) {
                 nodes.assign(nodeSet.begin(), nodeSet.end());
             }
 
-            int numNodesPerElem = (block.cellType == "tet") ? 4 : (block.cellType == "pyr") ? 5 : 8;
+            int numNodesPerElem = (block.cellType == "tet")   ? 4 :
+                                  (block.cellType == "pyr")   ? 5 :
+                                  (block.cellType == "wedge") ? 6 : 8;
+            if ((int)nodes.size() != numNodesPerElem) {
+                std::cerr << "Warning: cell " << cellIdx << " (type=" << block.cellType
+                          << ") returned " << nodes.size() << " nodes, expected "
+                          << numNodesPerElem << std::endl;
+            }
             for (int i = 0; i < numNodesPerElem; ++i) {
-                connectivity.push_back(i < nodes.size() ? nodes[i] + 1 : 1);
+                connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1 : 1);
             }
         }
 
@@ -1075,10 +1315,12 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader) {
             orderedNodes = orderTetNodes(cell, faces, points);
         } else if (cell.type == "pyr") {
             orderedNodes = orderPyramidNodes(cell, faces, points);
+        } else if (cell.type == "wedge") {
+            orderedNodes = orderWedgeNodes(cell, faces, points);
         } else {
             std::set<int> nodeSet;
             for (int faceIdx : cell.faceIndices) {
-                if (faceIdx >= 0 && faceIdx < faces.size()) {
+                if (faceIdx >= 0 && faceIdx < (int)faces.size()) {
                     for (int nodeIdx : faces[faceIdx].pointIndices) {
                         nodeSet.insert(nodeIdx);
                     }
@@ -1131,7 +1373,7 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader) {
 
         for (int j = 0; j < patch.nFaces; ++j) {
             int faceIdx = patch.startFace + j;
-            if (faceIdx < owner.size()) {
+            if (faceIdx < (int)owner.size()) {
                 int cellIdx = owner[faceIdx];
                 elem_list.push_back(cellIdx + 1);
 
@@ -1139,8 +1381,16 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader) {
                 const auto& cell = cells[cellIdx];
                 int sideId = 1;
 
-                if (cell.type == "hex" && cellToOrderedNodes.count(cellIdx)) {
-                    sideId = getHexFaceId(face.pointIndices, cellToOrderedNodes[cellIdx]);
+                if (cellToOrderedNodes.count(cellIdx)) {
+                    const auto& ordNodes = cellToOrderedNodes[cellIdx];
+                    if (cell.type == "hex")
+                        sideId = getHexFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "tet")
+                        sideId = getTetFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "pyr")
+                        sideId = getPyramidFaceId(face.pointIndices, ordNodes);
+                    else if (cell.type == "wedge")
+                        sideId = getWedgeFaceId(face.pointIndices, ordNodes);
                 }
 
                 side_list.push_back(sideId);

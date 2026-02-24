@@ -56,7 +56,12 @@ private:
                                     const std::vector<Point>& points);
     std::vector<int> orderPyramidNodes(const Cell& cell, const std::vector<Face>& faces,
                                         const std::vector<Point>& points);
+    std::vector<int> orderWedgeNodes(const Cell& cell, const std::vector<Face>& faces,
+                                      const std::vector<Point>& points);
     int getHexFaceId(const std::vector<int>& faceNodes, const std::vector<int>& hexNodes);
+    int getTetFaceId(const std::vector<int>& faceNodes, const std::vector<int>& tetNodes);
+    int getPyramidFaceId(const std::vector<int>& faceNodes, const std::vector<int>& pyrNodes);
+    int getWedgeFaceId(const std::vector<int>& faceNodes, const std::vector<int>& wedgeNodes);
 };
 
 #endif

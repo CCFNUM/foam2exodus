@@ -725,15 +725,19 @@ void OpenFOAMMeshReader::constructCells() {
     
     for (auto& cell : cells) {
         int nFaces = cell.faceIndices.size();
-        if (nFaces == 6) {
-            cell.type = "hex";
-        } else if (nFaces == 4) {
-            cell.type = "tet";
-        } else if (nFaces == 5) {
-            cell.type = "pyr";
-        } else {
-            cell.type = "unknown";
+        int nTri = 0, nQuad = 0;
+        for (int fi : cell.faceIndices) {
+            if (fi >= 0 && fi < (int)faces.size()) {
+                int nPts = faces[fi].pointIndices.size();
+                if (nPts == 3) ++nTri;
+                else if (nPts == 4) ++nQuad;
+            }
         }
+        if      (nFaces == 4 && nTri == 4 && nQuad == 0) cell.type = "tet";
+        else if (nFaces == 6 && nQuad == 6 && nTri == 0) cell.type = "hex";
+        else if (nFaces == 5 && nQuad == 1 && nTri == 4) cell.type = "pyr";
+        else if (nFaces == 5 && nQuad == 3 && nTri == 2) cell.type = "wedge";
+        else                                              cell.type = "unknown";
     }
     
     std::cout << "Constructed " << cells.size() << " cells" << std::endl;
