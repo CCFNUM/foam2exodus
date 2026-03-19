@@ -7,7 +7,7 @@
 # Arts.
 # SPDX-License-Identifier: BSD-3-Clause
 
-SOURCE='\.\./\.\./(src|include)/.*\.(c|cpp|C|h|hpp|H)'
+SOURCE='\.\./\.\./src/.*\.(c|cpp|C|h|hpp|H)'
 
 # format in-place
 find ../.. \
