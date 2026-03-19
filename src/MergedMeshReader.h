@@ -1,7 +1,7 @@
 // File       : MergedMeshReader.h
 // Created    : Thu Mar 19 2026
 // Author     : Mhamad Mahdi Alloush
-// Description: 
+// Description:
 // Copyright (c) 2026 CCFNUM, Lucerne University of Applied Sciences and
 // Arts.
 // SPDX-License-Identifier: BSD-3-Clause
@@ -10,41 +10,92 @@
 #define MERGED_MESH_READER_H
 
 #include "OpenFOAMMeshReader.h"
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
 
 /**
- * MergedMeshReader - Reads multiple OpenFOAM meshes and merges them into a single mesh
+ * MergedMeshReader - Reads multiple OpenFOAM meshes and merges them into a
+ * single mesh
  *
  * This class maintains separate element blocks for each source mesh by:
  * - Offsetting all indices (nodes, cells, faces) appropriately
  * - Creating unique names for zones and boundary patches from each mesh
  * - Providing a unified interface compatible with OpenFOAMMeshReader
  */
-class MergedMeshReader {
+class MergedMeshReader
+{
 public:
     MergedMeshReader(const std::vector<std::string>& casePaths);
 
     void readMeshes();
 
     // Interface compatible with OpenFOAMMeshReader
-    int getNumPoints() const { return mergedPoints.size(); }
-    int getNumCells() const { return mergedCells.size(); }
-    int getNumBoundaryPatches() const { return mergedBoundaryPatches.size(); }
-    int getNumCellZones() const { return mergedCellZones.size(); }
+    int getNumPoints() const
+    {
+        return mergedPoints.size();
+    }
 
-    const std::vector<Point>& getPoints() const { return mergedPoints; }
-    const std::vector<Face>& getFaces() const { return mergedFaces; }
-    const std::vector<Cell>& getCells() const { return mergedCells; }
-    const std::vector<BoundaryPatch>& getBoundaryPatches() const { return mergedBoundaryPatches; }
-    const std::vector<CellZone>& getCellZones() const { return mergedCellZones; }
-    const std::vector<int>& getOwner() const { return mergedOwner; }
-    const std::vector<int>& getNeighbour() const { return mergedNeighbour; }
+    int getNumCells() const
+    {
+        return mergedCells.size();
+    }
+
+    int getNumBoundaryPatches() const
+    {
+        return mergedBoundaryPatches.size();
+    }
+
+    int getNumCellZones() const
+    {
+        return mergedCellZones.size();
+    }
+
+    const std::vector<Point>& getPoints() const
+    {
+        return mergedPoints;
+    }
+
+    const std::vector<Face>& getFaces() const
+    {
+        return mergedFaces;
+    }
+
+    const std::vector<Cell>& getCells() const
+    {
+        return mergedCells;
+    }
+
+    const std::vector<BoundaryPatch>& getBoundaryPatches() const
+    {
+        return mergedBoundaryPatches;
+    }
+
+    const std::vector<CellZone>& getCellZones() const
+    {
+        return mergedCellZones;
+    }
+
+    const std::vector<int>& getOwner() const
+    {
+        return mergedOwner;
+    }
+
+    const std::vector<int>& getNeighbour() const
+    {
+        return mergedNeighbour;
+    }
 
     // Custom naming maps for distinct element blocks and sidesets
-    const std::map<std::string, std::string>& getElementBlockNames() const { return elementBlockNames; }
-    const std::map<std::string, std::string>& getSidesetNames() const { return sidesetNames; }
+    const std::map<std::string, std::string>& getElementBlockNames() const
+    {
+        return elementBlockNames;
+    }
+
+    const std::map<std::string, std::string>& getSidesetNames() const
+    {
+        return sidesetNames;
+    }
 
 private:
     std::vector<std::string> casePaths;
@@ -64,11 +115,13 @@ private:
     std::map<std::string, std::string> sidesetNames;
 
     // Offset tracking
-    struct MeshOffsets {
+    struct MeshOffsets
+    {
         int nodeOffset;
         int faceOffset;
         int cellOffset;
     };
+
     std::vector<MeshOffsets> offsets;
 
     void mergeMeshes();
