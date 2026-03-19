@@ -223,22 +223,12 @@ clang++ --version  # Should be 5.0 or higher
 
 This project is under active development. Contributions, bug reports, and feature requests are welcome.
 
-## License
+## Licence
 
-[Specify your license here]
+BSD-3-Clause.  See file headers for details.
 
-## Authors
+Copyright (c) 2026 CCFNUM, Lucerne University of Applied Sciences and Arts.
 
-[Specify authors/contributors here]
+## Contact
 
-## Acknowledgments
-
-- Built using the NetCDF library for Exodus II format support
-- Designed for integration with OpenFOAM mesh structures
-- Follows the Exodus II database specification
-
-## References
-
-- [OpenFOAM Documentation](https://www.openfoam.com/)
-- [Exodus II Format Specification](https://gsjaardema.github.io/seacas/)
-- [NetCDF Library](https://www.unidata.ucar.edu/software/netcdf/)
+* **Project Maintainer:** Lucian Hanimann ([lucian.hanimann@hslu.ch](mailto:lucian.hanimann@hslu.ch))
