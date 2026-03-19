@@ -54,16 +54,16 @@ include_directories(${NETCDF_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
 # CLI executable
-add_executable(foam2Exodus
+add_executable(foam2exodus
     main.cpp
     src/OpenFOAMMeshReader.cpp
     src/ExodusWriter.cpp
     src/MergedMeshReader.cpp
 )
 
-target_link_libraries(foam2Exodus ${NETCDF_LIBRARIES})
+target_link_libraries(foam2exodus ${NETCDF_LIBRARIES})
 
-install(TARGETS foam2Exodus DESTINATION bin)
+install(TARGETS foam2exodus DESTINATION bin)
 
 # GUI executable (optional, only if Qt5 and GUI sources are found)
 if(DEFINED QT5_DIR)

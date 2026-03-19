@@ -1,10 +1,10 @@
-# foam2Exodus
+# foam2exodus
 
 A converter utility that translates OpenFOAM mesh and field data into the Exodus II database format.
 
 ## Overview
 
-foam2Exodus is a tool designed to convert OpenFOAM computational fluid dynamics (CFD) cases into the Exodus II format, a widely-used database format for finite element analysis. The Exodus II format enables visualization and post-processing in various scientific visualization tools such as ParaView, VisIt, and others.
+foam2exodus is a tool designed to convert OpenFOAM computational fluid dynamics (CFD) cases into the Exodus II format, a widely-used database format for finite element analysis. The Exodus II format enables visualization and post-processing in various scientific visualization tools such as ParaView, VisIt, and others.
 
 ### Current Status (Under Development)
 
@@ -63,7 +63,7 @@ foam2Exodus is a tool designed to convert OpenFOAM computational fluid dynamics 
 ### Step 1: Clone or Navigate to the Repository
 
 ```bash
-cd /path/to/foam2Exodus
+cd /path/to/foam2exodus
 ```
 
 ### Step 2: Create Build Directory
@@ -103,14 +103,21 @@ make -j$(sysctl -n hw.ncpu)  # macOS
 sudo make install
 ```
 
-This will install the `foam2Exodus` executable to `/usr/local/bin` by default.
+This will install the `foam2exodus` executable to `/usr/local/bin` by default.
 
 ## Usage
 
 ### Basic Syntax
 
 ```bash
-foam2Exodus <OpenFOAM_case_dir> <output.exo>
+foam2exodus <OpenFOAM_case_dir> <output.exo>
+```
+
+### Advanced
+
+Convert multiple meshes and merge into single exodus file
+```bash
+foam2exodus --multiple <OpenFOAM_case_dir_1> <OpenFOAM_case_dir_2> <output.exo>
 ```
 
 ### Arguments
@@ -122,12 +129,12 @@ foam2Exodus <OpenFOAM_case_dir> <output.exo>
 
 Convert a serial OpenFOAM case:
 ```bash
-./foam2Exodus /path/to/openfoam/case myMesh.exo
+./foam2exodus /path/to/openfoam/case myMesh.exo
 ```
 
 Convert and specify full output path:
 ```bash
-./foam2Exodus ~/simulations/cavity ~/results/cavity_mesh.exo
+./foam2exodus ~/simulations/cavity ~/results/cavity_mesh.exo
 ```
 
 ### Output
@@ -161,10 +168,10 @@ Boundary patches from OpenFOAM are automatically exported as sidesets in the Exo
 ## Project Structure
 
 ```
-foam2Exodus/
+foam2exodus/
 ├── CMakeLists.txt           # CMake build configuration
 ├── README.md                # This file
-├── foam2Exodus/
+├── foam2exodus/
 │   ├── main.cpp            # Main entry point
 │   ├── src/
 │   │   ├── OpenFOAMMeshReader.h    # OpenFOAM mesh reader interface
