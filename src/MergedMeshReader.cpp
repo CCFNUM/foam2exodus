@@ -1,3 +1,11 @@
+// File       : MergedMeshReader.cpp
+// Created    : Thu Mar 19 2026
+// Author     : Mhamad Mahdi Alloush
+// Description: 
+// Copyright (c) 2026 CCFNUM, Lucerne University of Applied Sciences and
+// Arts.
+// SPDX-License-Identifier: BSD-3-Clause
+
 #include "MergedMeshReader.h"
 #include <iostream>
 #include <stdexcept>

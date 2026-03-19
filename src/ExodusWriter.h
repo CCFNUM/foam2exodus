@@ -1,3 +1,11 @@
+// File       : ExodusWriter.h
+// Created    : Thu Mar 19 2026
+// Author     : Mhamad Mahdi Alloush
+// Description: 
+// Copyright (c) 2026 CCFNUM, Lucerne University of Applied Sciences and
+// Arts.
+// SPDX-License-Identifier: BSD-3-Clause
+
 #ifndef EXODUS_WRITER_H
 #define EXODUS_WRITER_H
 
