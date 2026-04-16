@@ -13,6 +13,7 @@
 #include <map>
 #include <netcdf.h>
 #include <string>
+#include <vector>
 
 // Forward declaration for MergedMeshReader
 class MergedMeshReader;
@@ -39,6 +40,12 @@ private:
     int ncid;
     std::map<std::string, std::string> customElementBlockNames;
     std::map<std::string, std::string> customSidesetNames;
+
+    // Maps OpenFOAM cell index to 1-based Exodus element ID. Populated by
+    // writeElements as cells are assigned to blocks (which reorders them by
+    // zone/type), and consumed by writeSideSets so that sideset entries refer
+    // to the correct Exodus element.
+    std::vector<int> cellToExodusElem;
 
     void initializeExodusFile(int numNodes,
                               int numElems,

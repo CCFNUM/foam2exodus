@@ -298,14 +298,16 @@ void OpenFOAMMeshReader::readPointsBinary(std::ifstream& file, int nPoints)
     }
 }
 
-void OpenFOAMMeshReader::readFacesBinary(std::ifstream& file, int nFaces)
+void OpenFOAMMeshReader::readFacesBinary(std::ifstream& file, int nOffsets)
 {
     // For faceCompactList binary format:
-    // nFaces (ASCII)
-    // ( offset_0 offset_1 ... offset_nFaces-1 ) (binary ints, no list size
-    // prefix) Note: OpenFOAM stores only nFaces offsets, not nFaces+1 The last
-    // offset value equals totalData totalData (ASCII) ( point_0 point_1 ...
-    // point_totalData-1 ) (binary ints, no list size prefix)
+    // The ASCII header count is the number of offsets, which is
+    // realNumFaces + 1 (the trailing offset is the end-of-data marker).
+    //   nOffsets (ASCII)               -- = realNumFaces + 1
+    //   ( offset_0 ... offset_{n-1} )  -- binary ints, no list-size prefix
+    //   totalData (ASCII)              -- = offset_{n-1}, redundant
+    //   ( pt_0 ... pt_{totalData-1} )  -- binary ints, no list-size prefix
+    int nFaces = nOffsets - 1;
 
     // Skip whitespace and read opening parenthesis for indices
     char c;
@@ -323,9 +325,9 @@ void OpenFOAMMeshReader::readFacesBinary(std::ifstream& file, int nFaces)
         }
     }
 
-    // Read offset indices array - only nFaces offsets (not nFaces+1)
-    std::vector<int> indices(nFaces);
-    for (int i = 0; i < nFaces; ++i)
+    // Read the full offset array (nOffsets = nFaces + 1 entries).
+    std::vector<int> indices(nOffsets);
+    for (int i = 0; i < nOffsets; ++i)
     {
         indices[i] = readBinary<int>(file);
         if (!file.good())
@@ -365,16 +367,13 @@ void OpenFOAMMeshReader::readFacesBinary(std::ifstream& file, int nFaces)
             e.what());
     }
 
-    // Verify totalData matches last offset
-    if (nFaces > 0 && totalData != indices[nFaces - 1])
+    // Verify totalData matches the trailing offset.
+    if (nOffsets > 0 && totalData != indices[nOffsets - 1])
     {
         throw std::runtime_error("Face data count mismatch: expected " +
-                                 std::to_string(indices[nFaces - 1]) +
+                                 std::to_string(indices[nOffsets - 1]) +
                                  " but got " + std::to_string(totalData));
     }
-
-    // Add implicit last offset for easier processing
-    indices.push_back(totalData);
 
     // Skip whitespace and read opening parenthesis for data
     while (file.get(c))

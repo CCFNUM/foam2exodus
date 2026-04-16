@@ -728,6 +728,9 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 
     nc_enddef(ncid);
 
+    cellToExodusElem.assign(cells.size(), 0);
+    int nextExodusElem = 1;
+
     blockId = 1;
     for (const auto& block : blocks)
     {
@@ -735,6 +738,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 
         for (int cellIdx : block.cellIndices)
         {
+            cellToExodusElem[cellIdx] = nextExodusElem++;
+
             const auto& cell = cells[cellIdx];
 
             std::vector<int> nodes;
@@ -1184,7 +1189,11 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
             if (faceIdx < owner.size())
             {
                 int cellIdx = owner[faceIdx];
-                elem_list.push_back(cellIdx + 1);
+                int exoId =
+                    (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
+                        ? cellToExodusElem[cellIdx]
+                        : (cellIdx + 1);
+                elem_list.push_back(exoId);
 
                 const auto& face = faces[faceIdx];
                 const auto& cell = cells[cellIdx];
@@ -1559,6 +1568,9 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
 
     nc_enddef(ncid);
 
+    cellToExodusElem.assign(cells.size(), 0);
+    int nextExodusElem = 1;
+
     blockId = 1;
     for (const auto& block : blocks)
     {
@@ -1566,6 +1578,8 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
 
         for (int cellIdx : block.cellIndices)
         {
+            cellToExodusElem[cellIdx] = nextExodusElem++;
+
             const auto& cell = cells[cellIdx];
 
             std::vector<int> nodes;
@@ -1773,7 +1787,11 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
             if (faceIdx < (int)owner.size())
             {
                 int cellIdx = owner[faceIdx];
-                elem_list.push_back(cellIdx + 1);
+                int exoId =
+                    (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
+                        ? cellToExodusElem[cellIdx]
+                        : (cellIdx + 1);
+                elem_list.push_back(exoId);
 
                 const auto& face = faces[faceIdx];
                 const auto& cell = cells[cellIdx];
