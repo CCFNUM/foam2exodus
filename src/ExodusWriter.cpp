@@ -14,6 +14,7 @@
 #include <iostream>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 ExodusWriter::ExodusWriter(const std::string& filename)
     : filename(filename), ncid(-1)
@@ -154,12 +155,20 @@ void ExodusWriter::initializeExodusFile(int numNodes,
 
 void ExodusWriter::writeNodes(const std::vector<Point>& points)
 {
+    size_t total = points.size() + polyExtraPoints.size();
     std::vector<double> x_coords, y_coords, z_coords;
-    x_coords.reserve(points.size());
-    y_coords.reserve(points.size());
-    z_coords.reserve(points.size());
+    x_coords.reserve(total);
+    y_coords.reserve(total);
+    z_coords.reserve(total);
 
     for (const auto& p : points)
+    {
+        x_coords.push_back(p.x);
+        y_coords.push_back(p.y);
+        z_coords.push_back(p.z);
+    }
+    // Centroid nodes added by the polyhedral decomposition (empty otherwise).
+    for (const auto& p : polyExtraPoints)
     {
         x_coords.push_back(p.x);
         y_coords.push_back(p.y);
@@ -184,8 +193,7 @@ void ExodusWriter::writeNodes(const std::vector<Point>& points)
     status = nc_put_var_double(ncid, var_id, z_coords.data());
     checkError(status, "Failed to write coordz data");
 
-    std::cout << "Wrote " << points.size() << " nodes to Exodus file"
-              << std::endl;
+    std::cout << "Wrote " << total << " nodes to Exodus file" << std::endl;
 }
 
 std::vector<int> ExodusWriter::orderTetNodes(const Cell& cell,
@@ -580,6 +588,223 @@ std::vector<int> ExodusWriter::orderHexNodes(const Cell& cell,
     return orderedNodes;
 }
 
+std::vector<std::string>
+ExodusWriter::buildCellGroups(const std::vector<Cell>& cells,
+                             const std::vector<CellZone>& cellZones) const
+{
+    // Mirror the standard-block grouping in writeElements: with >1 zone, cells
+    // are grouped by zone name (or "unzoned"); otherwise a single "fluid" group.
+    std::vector<std::string> grp(cells.size(), "fluid");
+    if (cellZones.size() > 1)
+    {
+        std::fill(grp.begin(), grp.end(), "unzoned");
+        for (const auto& z : cellZones)
+            for (int ci : z.cellIndices)
+                if (ci >= 0 && ci < (int)cells.size())
+                    grp[ci] = z.name;
+    }
+    return grp;
+}
+
+void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
+                                          const std::vector<Face>& faces,
+                                          const std::vector<Cell>& cells,
+                                          const std::vector<int>& owner,
+                                          int boundaryStart)
+{
+    polyExtraPoints.clear();
+    polySubElems.clear();
+    polySubElemCell.clear();
+    polySubElemExoId.clear();
+    polyFaceToSubs.clear();
+    cellDecomposed.assign(cells.size(), 0);
+
+    const int nBase = (int)points.size();
+
+    // Coordinate of a node index in the combined [base ; extra] space. Returns
+    // by value so it stays valid across push_backs into polyExtraPoints.
+    auto pointAt = [&](int idx) -> Point
+    {
+        return (idx < nBase) ? points[idx] : polyExtraPoints[idx - nBase];
+    };
+
+    // Signed volume (x6) of tet (a,b,c,d); >0 for positive Exodus orientation.
+    auto tetVol = [&](int a, int b, int c, int d) -> double
+    {
+        Point p0 = pointAt(a), p1 = pointAt(b), p2 = pointAt(c), p3 = pointAt(d);
+        double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
+        double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
+        double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
+        return v1x * (v2y * v3z - v2z * v3y) + v1y * (v2z * v3x - v2x * v3z) +
+               v1z * (v2x * v3y - v2y * v3x);
+    };
+
+    // Divergence-theorem contribution of an outward triangle, used to get the
+    // signed volume of a standard element from its Exodus (outward) faces.
+    auto triDiv = [&](int a, int b, int c) -> double
+    {
+        Point A = pointAt(a), B = pointAt(b), C = pointAt(c);
+        return A.x * (B.y * C.z - B.z * C.y) + A.y * (B.z * C.x - B.x * C.z) +
+               A.z * (B.x * C.y - B.y * C.x);
+    };
+    // Signed volume of a standard element given its ordered nodes; <=0 means
+    // the ordering is invalid/inverted and the cell should be decomposed.
+    auto stdVol = [&](const std::vector<int>& n, const std::string& t) -> double
+    {
+        double v = 0.0;
+        auto Q = [&](int a, int b, int c, int d)
+        { v += triDiv(n[a], n[b], n[c]) + triDiv(n[a], n[c], n[d]); };
+        auto T = [&](int a, int b, int c) { v += triDiv(n[a], n[b], n[c]); };
+        if (t == "hex")
+        {
+            Q(0, 1, 5, 4); Q(1, 2, 6, 5); Q(2, 3, 7, 6);
+            Q(3, 0, 4, 7); Q(0, 3, 2, 1); Q(4, 5, 6, 7);
+        }
+        else if (t == "tet")
+        {
+            T(0, 1, 3); T(1, 2, 3); T(2, 0, 3); T(0, 2, 1);
+        }
+        else if (t == "pyr")
+        {
+            T(0, 1, 4); T(1, 2, 4); T(2, 3, 4); T(3, 0, 4); Q(0, 3, 2, 1);
+        }
+        else if (t == "wedge")
+        {
+            Q(0, 1, 4, 3); Q(1, 2, 5, 4); Q(2, 0, 3, 5); T(0, 2, 1); T(3, 4, 5);
+        }
+        return v / 6.0;
+    };
+
+    // Face centroids are shared per face so both adjacent poly cells fan an
+    // n-gon identically, keeping the split conformal.
+    std::unordered_map<int, int> faceCentroidNode;
+
+    for (int c = 0; c < (int)cells.size(); ++c)
+    {
+        const auto& cell = cells[c];
+
+        // Decompose "unknown" cells, and also any standard cell whose ordering
+        // would yield a non-positive volume (mirrors what writeElements emits,
+        // so those otherwise-inverted elements are rescued as valid sub-cells).
+        if (cell.type != "unknown")
+        {
+            std::vector<int> on;
+            int need = 8;
+            if (cell.type == "hex")
+                on = orderHexNodes(cell, faces, points);
+            else if (cell.type == "tet")
+                on = orderTetNodes(cell, faces, points), need = 4;
+            else if (cell.type == "pyr")
+                on = orderPyramidNodes(cell, faces, points), need = 5;
+            else if (cell.type == "wedge")
+                on = orderWedgeNodes(cell, faces, points), need = 6;
+            if ((int)on.size() == need && stdVol(on, cell.type) > 0.0)
+                continue;  // valid standard element; leave it as-is
+        }
+        cellDecomposed[c] = 1;
+
+        std::set<int> verts;
+        for (int fi : cell.faceIndices)
+            if (fi >= 0 && fi < (int)faces.size())
+                for (int n : faces[fi].pointIndices)
+                    verts.insert(n);
+        if (verts.empty())
+            continue;
+
+        // Cell centroid (apex of every sub-element) = mean of cell vertices.
+        double cx = 0, cy = 0, cz = 0;
+        for (int n : verts)
+        {
+            Point p = pointAt(n);
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
+        }
+        cx /= verts.size();
+        cy /= verts.size();
+        cz /= verts.size();
+        int cNode = nBase + (int)polyExtraPoints.size();
+        polyExtraPoints.push_back({cx, cy, cz});
+
+        for (int fi : cell.faceIndices)
+        {
+            if (fi < 0 || fi >= (int)faces.size())
+                continue;
+            const auto& fv = faces[fi].pointIndices;
+            int nv = (int)fv.size();
+            bool onBoundary = (fi >= boundaryStart) && (owner[fi] == c);
+
+            if (nv == 3)
+            {
+                int a = fv[0], b = fv[1], cc = fv[2];
+                if (tetVol(a, b, cc, cNode) < 0)
+                    std::swap(b, cc);
+                int gid = (int)polySubElems.size();
+                polySubElems.push_back({'T', {a, b, cc, cNode}});
+                if (onBoundary)
+                    polyFaceToSubs[fi].push_back(
+                        {gid, getTetFaceId(fv, polySubElems[gid].nodes)});
+            }
+            else if (nv == 4)
+            {
+                int q0 = fv[0], q1 = fv[1], q2 = fv[2], q3 = fv[3];
+                // Orient the base from the true split volume (same q0-q2
+                // diagonal the pyramid is later evaluated on), which is robust
+                // for warped quads unlike a single-triangle normal.
+                if (tetVol(q0, q1, q2, cNode) + tetVol(q0, q2, q3, cNode) < 0)
+                    std::swap(q1, q3);
+                int gid = (int)polySubElems.size();
+                polySubElems.push_back({'P', {q0, q1, q2, q3, cNode}});
+                if (onBoundary)
+                    polyFaceToSubs[fi].push_back(
+                        {gid, getPyramidFaceId(fv, polySubElems[gid].nodes)});
+            }
+            else if (nv >= 5)
+            {
+                int fNode;
+                auto it = faceCentroidNode.find(fi);
+                if (it == faceCentroidNode.end())
+                {
+                    double fx = 0, fy = 0, fz = 0;
+                    for (int n : fv)
+                    {
+                        Point p = pointAt(n);
+                        fx += p.x;
+                        fy += p.y;
+                        fz += p.z;
+                    }
+                    fNode = nBase + (int)polyExtraPoints.size();
+                    polyExtraPoints.push_back({fx / nv, fy / nv, fz / nv});
+                    faceCentroidNode[fi] = fNode;
+                }
+                else
+                {
+                    fNode = it->second;
+                }
+                for (int k = 0; k < nv; ++k)
+                {
+                    int a = fv[k], b = fv[(k + 1) % nv];
+                    int y = b, z = fNode;
+                    if (tetVol(a, y, z, cNode) < 0)
+                        std::swap(y, z);
+                    int gid = (int)polySubElems.size();
+                    polySubElems.push_back({'T', {a, y, z, cNode}});
+                    if (onBoundary)
+                    {
+                        std::vector<int> tri = {a, b, fNode};
+                        polyFaceToSubs[fi].push_back(
+                            {gid, getTetFaceId(tri, polySubElems[gid].nodes)});
+                    }
+                }
+            }
+        }
+        // All sub-elements just appended belong to this cell.
+        polySubElemCell.resize(polySubElems.size(), c);
+    }
+
+    polySubElemExoId.assign(polySubElems.size(), 0);
+}
+
 void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 {
     const auto& cells = reader.getCells();
@@ -594,10 +819,16 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         std::string name;
         std::vector<int> cellIndices;
         std::string cellType;
+        // Decomposed polyhedral blocks carry sub-element indices instead of
+        // cell indices; connectivity is taken from polySubElems.
+        bool decomposed = false;
+        std::vector<int> subIndices;
     };
 
     std::vector<BlockInfo> blocks;
 
+    // "unknown" cells never form a block of their own; they are decomposed
+    // into the tet/pyramid blocks appended below.
     if (!cellZones.empty() && cellZones.size() > 1)
     {
         std::set<int> zonedCells;
@@ -610,7 +841,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
             {
                 if (cellIdx < cells.size())
                 {
-                    zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
+                    if (!cellDecomposed[cellIdx])
+                        zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
                     zonedCells.insert(cellIdx);
                 }
             }
@@ -629,7 +861,7 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         std::map<std::string, std::vector<int>> unzonedElemsByType;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            if (zonedCells.find(i) == zonedCells.end())
+            if (zonedCells.find(i) == zonedCells.end() && !cellDecomposed[i])
             {
                 unzonedElemsByType[cells[i].type].push_back(i);
             }
@@ -650,7 +882,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         std::map<std::string, std::vector<int>> elemsByType;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            elemsByType[cells[i].type].push_back(i);
+            if (!cellDecomposed[i])
+                elemsByType[cells[i].type].push_back(i);
         }
 
         for (const auto& [cellType, cellIndices] : elemsByType)
@@ -664,10 +897,42 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         }
     }
 
+    // Append decomposed tet/pyramid blocks grouped by region (zone/mesh), so a
+    // rotor poly block never mixes with a stator one.
+    {
+        std::vector<std::string> grp = buildCellGroups(cells, cellZones);
+        std::map<std::string, std::vector<int>> tetByGrp, pyrByGrp;
+        for (int g = 0; g < (int)polySubElems.size(); ++g)
+        {
+            const std::string& k = grp[polySubElemCell[g]];
+            (polySubElems[g].type == 'T' ? tetByGrp : pyrByGrp)[k].push_back(g);
+        }
+        for (auto& [k, gids] : tetByGrp)
+        {
+            BlockInfo block;
+            block.name = getBlockName(k + "-poly-tet");
+            block.cellType = "tet";
+            block.decomposed = true;
+            block.subIndices = std::move(gids);
+            blocks.push_back(std::move(block));
+        }
+        for (auto& [k, gids] : pyrByGrp)
+        {
+            BlockInfo block;
+            block.name = getBlockName(k + "-poly-pyr");
+            block.cellType = "pyr";
+            block.decomposed = true;
+            block.subIndices = std::move(gids);
+            blocks.push_back(std::move(block));
+        }
+    }
+
     int blockId = 1;
     for (const auto& block : blocks)
     {
-        int numElemsInBlock = block.cellIndices.size();
+        int numElemsInBlock =
+            block.decomposed ? (int)block.subIndices.size()
+                             : (int)block.cellIndices.size();
 
         int numNodesPerElem = 8;
         std::string exoType = "HEX8";
@@ -736,62 +1001,57 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
     {
         std::vector<int> connectivity;
 
-        for (int cellIdx : block.cellIndices)
+        if (block.decomposed)
         {
-            cellToExodusElem[cellIdx] = nextExodusElem++;
-
-            const auto& cell = cells[cellIdx];
-
-            std::vector<int> nodes;
-            if (block.cellType == "hex")
+            for (int gid : block.subIndices)
             {
-                nodes = orderHexNodes(cell, faces, points);
-            }
-            else if (block.cellType == "tet")
-            {
-                nodes = orderTetNodes(cell, faces, points);
-            }
-            else if (block.cellType == "pyr")
-            {
-                nodes = orderPyramidNodes(cell, faces, points);
-            }
-            else if (block.cellType == "wedge")
-            {
-                nodes = orderWedgeNodes(cell, faces, points);
-            }
-            else
-            {
-                std::set<int> nodeSet;
-                for (int faceIdx : cell.faceIndices)
-                {
-                    if (faceIdx >= 0 && faceIdx < (int)faces.size())
-                    {
-                        for (int nodeIdx : faces[faceIdx].pointIndices)
-                        {
-                            nodeSet.insert(nodeIdx);
-                        }
-                    }
-                }
-                nodes.assign(nodeSet.begin(), nodeSet.end());
-            }
-
-            int numNodesPerElem = (block.cellType == "tet")     ? 4
-                                  : (block.cellType == "pyr")   ? 5
-                                  : (block.cellType == "wedge") ? 6
-                                                                : 8;
-            if ((int)nodes.size() != numNodesPerElem)
-            {
-                std::cerr << "Warning: cell " << cellIdx
-                          << " (type=" << block.cellType << ") returned "
-                          << nodes.size() << " nodes, expected "
-                          << numNodesPerElem << std::endl;
-            }
-            for (int i = 0; i < numNodesPerElem; ++i)
-            {
-                connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
-                                                             : 1);
+                polySubElemExoId[gid] = nextExodusElem++;
+                for (int n : polySubElems[gid].nodes)
+                    connectivity.push_back(n + 1);
             }
         }
+        else
+            for (int cellIdx : block.cellIndices)
+            {
+                cellToExodusElem[cellIdx] = nextExodusElem++;
+
+                const auto& cell = cells[cellIdx];
+
+                std::vector<int> nodes;
+                if (block.cellType == "hex")
+                {
+                    nodes = orderHexNodes(cell, faces, points);
+                }
+                else if (block.cellType == "tet")
+                {
+                    nodes = orderTetNodes(cell, faces, points);
+                }
+                else if (block.cellType == "pyr")
+                {
+                    nodes = orderPyramidNodes(cell, faces, points);
+                }
+                else if (block.cellType == "wedge")
+                {
+                    nodes = orderWedgeNodes(cell, faces, points);
+                }
+
+                int numNodesPerElem = (block.cellType == "tet")     ? 4
+                                      : (block.cellType == "pyr")   ? 5
+                                      : (block.cellType == "wedge") ? 6
+                                                                    : 8;
+                if ((int)nodes.size() != numNodesPerElem)
+                {
+                    std::cerr << "Warning: cell " << cellIdx
+                              << " (type=" << block.cellType << ") returned "
+                              << nodes.size() << " nodes, expected "
+                              << numNodesPerElem << std::endl;
+                }
+                for (int i = 0; i < numNodesPerElem; ++i)
+                {
+                    connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
+                                                                 : 1);
+                }
+            }
 
         int var_id;
         nc_inq_varid(
@@ -820,7 +1080,10 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         nc_put_vara_text(ncid, var_eb_names, start, count, name_buffer);
 
         std::cout << "Wrote element block " << blockId << " (" << block.name
-                  << ") with " << block.cellIndices.size() << " elements"
+                  << ") with "
+                  << (block.decomposed ? block.subIndices.size()
+                                       : block.cellIndices.size())
+                  << " elements"
                   << std::endl;
 
         blockId++;
@@ -1083,44 +1346,76 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         return;
     }
 
+    // Ordered nodes for standard cells only; polyhedral cells resolve their
+    // boundary faces through polyFaceToSubs instead.
     std::map<int, std::vector<int>> cellToOrderedNodes;
     for (size_t i = 0; i < cells.size(); ++i)
     {
         const auto& cell = cells[i];
-        std::vector<int> orderedNodes;
-
         if (cell.type == "hex")
-        {
-            orderedNodes = orderHexNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderHexNodes(cell, faces, points);
         else if (cell.type == "tet")
-        {
-            orderedNodes = orderTetNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderTetNodes(cell, faces, points);
         else if (cell.type == "pyr")
-        {
-            orderedNodes = orderPyramidNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderPyramidNodes(cell, faces, points);
         else if (cell.type == "wedge")
+            cellToOrderedNodes[i] = orderWedgeNodes(cell, faces, points);
+    }
+
+    // Build each patch's (elem, side) entries first. A boundary face of a
+    // polyhedral cell maps to the base side(s) of its sub-element(s); for an
+    // n-gon face that is several sides, so the per-sideset count is not known
+    // until the faces are walked.
+    std::vector<std::vector<int>> patchElem(patches.size());
+    std::vector<std::vector<int>> patchSide(patches.size());
+    for (size_t i = 0; i < patches.size(); ++i)
+    {
+        const auto& patch = patches[i];
+        auto& elem_list = patchElem[i];
+        auto& side_list = patchSide[i];
+
+        for (int j = 0; j < patch.nFaces; ++j)
         {
-            orderedNodes = orderWedgeNodes(cell, faces, points);
-        }
-        else
-        {
-            std::set<int> nodeSet;
-            for (int faceIdx : cell.faceIndices)
+            int faceIdx = patch.startFace + j;
+            if (faceIdx >= (int)owner.size())
+                continue;
+
+            auto pit = polyFaceToSubs.find(faceIdx);
+            if (pit != polyFaceToSubs.end())
             {
-                if (faceIdx >= 0 && faceIdx < (int)faces.size())
+                for (const auto& entry : pit->second)
                 {
-                    for (int nodeIdx : faces[faceIdx].pointIndices)
-                    {
-                        nodeSet.insert(nodeIdx);
-                    }
+                    elem_list.push_back(polySubElemExoId[entry.first]);
+                    side_list.push_back(entry.second);
                 }
+                continue;
             }
-            orderedNodes.assign(nodeSet.begin(), nodeSet.end());
+
+            int cellIdx = owner[faceIdx];
+            int exoId =
+                (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
+                    ? cellToExodusElem[cellIdx]
+                    : (cellIdx + 1);
+
+            const auto& face = faces[faceIdx];
+            const auto& cell = cells[cellIdx];
+            int sideId = 1;
+            auto cit = cellToOrderedNodes.find(cellIdx);
+            if (cit != cellToOrderedNodes.end())
+            {
+                const auto& ordNodes = cit->second;
+                if (cell.type == "hex")
+                    sideId = getHexFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "tet")
+                    sideId = getTetFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "pyr")
+                    sideId = getPyramidFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "wedge")
+                    sideId = getWedgeFaceId(face.pointIndices, ordNodes);
+            }
+            elem_list.push_back(exoId);
+            side_list.push_back(sideId);
         }
-        cellToOrderedNodes[i] = orderedNodes;
     }
 
     nc_redef(ncid);
@@ -1133,7 +1428,7 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         int dim_num_side_ss;
         nc_def_dim(ncid,
                    ("num_side_ss" + ss_num).c_str(),
-                   patch.nFaces,
+                   patchElem[i].size(),
                    &dim_num_side_ss);
 
         int var_elem_ss, var_side_ss;
@@ -1179,42 +1474,8 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         const auto& patch = patches[i];
         std::string ss_num = std::to_string(i + 1);
 
-        std::vector<int> elem_list, side_list;
-        elem_list.reserve(patch.nFaces);
-        side_list.reserve(patch.nFaces);
-
-        for (int j = 0; j < patch.nFaces; ++j)
-        {
-            int faceIdx = patch.startFace + j;
-            if (faceIdx < owner.size())
-            {
-                int cellIdx = owner[faceIdx];
-                int exoId =
-                    (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
-                        ? cellToExodusElem[cellIdx]
-                        : (cellIdx + 1);
-                elem_list.push_back(exoId);
-
-                const auto& face = faces[faceIdx];
-                const auto& cell = cells[cellIdx];
-                int sideId = 1;
-
-                if (cellToOrderedNodes.count(cellIdx))
-                {
-                    const auto& ordNodes = cellToOrderedNodes[cellIdx];
-                    if (cell.type == "hex")
-                        sideId = getHexFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "tet")
-                        sideId = getTetFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "pyr")
-                        sideId = getPyramidFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "wedge")
-                        sideId = getWedgeFaceId(face.pointIndices, ordNodes);
-                }
-
-                side_list.push_back(sideId);
-            }
-        }
+        const std::vector<int>& elem_list = patchElem[i];
+        const std::vector<int>& side_list = patchSide[i];
 
         int var_id;
         nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
@@ -1245,7 +1506,8 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         nc_put_vara_text(ncid, var_id, start, count, name_padded);
 
         std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
-                  << " with " << patch.nFaces << " faces" << std::endl;
+                  << " with " << elem_list.size() << " sides ("
+                  << patch.nFaces << " boundary faces)" << std::endl;
     }
 }
 
@@ -1254,13 +1516,30 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
     customElementBlockNames.clear();
     customSidesetNames.clear();
 
-    int numNodes = reader.getNumPoints();
-    int numElems = reader.getNumCells();
-    int numNodeSets = 0;
-    int numSideSets = reader.getNumBoundaryPatches();
-
     const auto& cells = reader.getCells();
     const auto& cellZones = reader.getCellZones();
+    const auto& patches = reader.getBoundaryPatches();
+
+    // Split polyhedral cells into conformal tets/pyramids before counting, as
+    // it adds centroid nodes and replaces each poly cell with sub-elements.
+    int boundaryStart = (int)reader.getFaces().size();
+    for (const auto& p : patches)
+        boundaryStart = std::min(boundaryStart, p.startFace);
+    buildPolyDecomposition(reader.getPoints(),
+                           reader.getFaces(),
+                           cells,
+                           reader.getOwner(),
+                           boundaryStart);
+
+    int nStandardCells = 0;
+    for (size_t i = 0; i < cells.size(); ++i)
+        if (!cellDecomposed[i])
+            ++nStandardCells;
+
+    int numNodes = reader.getNumPoints() + (int)polyExtraPoints.size();
+    int numElems = nStandardCells + (int)polySubElems.size();
+    int numNodeSets = 0;
+    int numSideSets = reader.getNumBoundaryPatches();
 
     int numElemBlocks = 0;
     if (!cellZones.empty())
@@ -1274,7 +1553,8 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
             {
                 if (cellIdx < cells.size())
                 {
-                    typesInZone.insert(cells[cellIdx].type);
+                    if (!cellDecomposed[cellIdx])
+                        typesInZone.insert(cells[cellIdx].type);
                     zonedCells.insert(cellIdx);
                 }
             }
@@ -1284,7 +1564,7 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
         std::set<std::string> unzonedTypes;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            if (zonedCells.find(i) == zonedCells.end())
+            if (zonedCells.find(i) == zonedCells.end() && !cellDecomposed[i])
             {
                 unzonedTypes.insert(cells[i].type);
             }
@@ -1293,12 +1573,22 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
     }
     else
     {
-        std::map<std::string, std::vector<int>> elemsByType;
+        std::set<std::string> types;
         for (size_t i = 0; i < cells.size(); ++i)
-        {
-            elemsByType[cells[i].type].push_back(i);
-        }
-        numElemBlocks = elemsByType.size();
+            if (!cellDecomposed[i])
+                types.insert(cells[i].type);
+        numElemBlocks = (int)types.size();
+    }
+
+    // One poly block per (region, tet/pyr) pair present; must match the block
+    // grouping in writeElements.
+    {
+        std::vector<std::string> grp = buildCellGroups(cells, cellZones);
+        std::set<std::string> polyKeys;
+        for (int g = 0; g < (int)polySubElems.size(); ++g)
+            polyKeys.insert(grp[polySubElemCell[g]] +
+                            (polySubElems[g].type == 'T' ? "\tT" : "\tP"));
+        numElemBlocks += (int)polyKeys.size();
     }
 
     initializeExodusFile(
@@ -1346,13 +1636,29 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
     customElementBlockNames.clear();
     customSidesetNames.clear();
 
-    int numNodes = reader.getNumPoints();
-    int numElems = reader.getNumCells();
-    int numNodeSets = 0;
-    int numSideSets = reader.getNumBoundaryPatches();
-
     const auto& cells = reader.getCells();
     const auto& cellZones = reader.getCellZones();
+    const auto& patches = reader.getBoundaryPatches();
+
+    // Split polyhedral cells into conformal tets/pyramids before counting.
+    int boundaryStart = (int)reader.getFaces().size();
+    for (const auto& p : patches)
+        boundaryStart = std::min(boundaryStart, p.startFace);
+    buildPolyDecomposition(reader.getPoints(),
+                           reader.getFaces(),
+                           cells,
+                           reader.getOwner(),
+                           boundaryStart);
+
+    int nStandardCells = 0;
+    for (size_t i = 0; i < cells.size(); ++i)
+        if (!cellDecomposed[i])
+            ++nStandardCells;
+
+    int numNodes = reader.getNumPoints() + (int)polyExtraPoints.size();
+    int numElems = nStandardCells + (int)polySubElems.size();
+    int numNodeSets = 0;
+    int numSideSets = reader.getNumBoundaryPatches();
 
     int numElemBlocks = 0;
     if (!cellZones.empty())
@@ -1366,7 +1672,8 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
             {
                 if (cellIdx < cells.size())
                 {
-                    typesInZone.insert(cells[cellIdx].type);
+                    if (!cellDecomposed[cellIdx])
+                        typesInZone.insert(cells[cellIdx].type);
                 }
             }
             numElemBlocks += typesInZone.size();
@@ -1379,7 +1686,7 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
         std::set<std::string> unzonedTypes;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            if (zonedCells.find(i) == zonedCells.end())
+            if (zonedCells.find(i) == zonedCells.end() && !cellDecomposed[i])
             {
                 unzonedTypes.insert(cells[i].type);
             }
@@ -1389,11 +1696,23 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
     else
     {
         std::set<std::string> types;
-        for (const auto& cell : cells)
+        for (size_t i = 0; i < cells.size(); ++i)
         {
-            types.insert(cell.type);
+            if (!cellDecomposed[i])
+                types.insert(cells[i].type);
         }
         numElemBlocks = types.size();
+    }
+
+    // One poly block per (region, tet/pyr) pair present; must match the block
+    // grouping in writeElements.
+    {
+        std::vector<std::string> grp = buildCellGroups(cells, cellZones);
+        std::set<std::string> polyKeys;
+        for (int g = 0; g < (int)polySubElems.size(); ++g)
+            polyKeys.insert(grp[polySubElemCell[g]] +
+                            (polySubElems[g].type == 'T' ? "\tT" : "\tP"));
+        numElemBlocks += (int)polyKeys.size();
     }
 
     initializeExodusFile(
@@ -1434,10 +1753,16 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         std::string name;
         std::vector<int> cellIndices;
         std::string cellType;
+        // Decomposed polyhedral blocks carry sub-element indices instead of
+        // cell indices; connectivity is taken from polySubElems.
+        bool decomposed = false;
+        std::vector<int> subIndices;
     };
 
     std::vector<BlockInfo> blocks;
 
+    // "unknown" cells never form a block of their own; they are decomposed
+    // into the tet/pyramid blocks appended below.
     if (!cellZones.empty() && cellZones.size() > 1)
     {
         std::set<int> zonedCells;
@@ -1450,7 +1775,8 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
             {
                 if (cellIdx < cells.size())
                 {
-                    zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
+                    if (!cellDecomposed[cellIdx])
+                        zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
                     zonedCells.insert(cellIdx);
                 }
             }
@@ -1469,7 +1795,7 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         std::map<std::string, std::vector<int>> unzonedElemsByType;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            if (zonedCells.find(i) == zonedCells.end())
+            if (zonedCells.find(i) == zonedCells.end() && !cellDecomposed[i])
             {
                 unzonedElemsByType[cells[i].type].push_back(i);
             }
@@ -1490,7 +1816,8 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         std::map<std::string, std::vector<int>> elemsByType;
         for (size_t i = 0; i < cells.size(); ++i)
         {
-            elemsByType[cells[i].type].push_back(i);
+            if (!cellDecomposed[i])
+                elemsByType[cells[i].type].push_back(i);
         }
 
         for (const auto& [cellType, cellIndices] : elemsByType)
@@ -1504,10 +1831,42 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         }
     }
 
+    // Append decomposed tet/pyramid blocks grouped by region (zone/mesh), so a
+    // rotor poly block never mixes with a stator one.
+    {
+        std::vector<std::string> grp = buildCellGroups(cells, cellZones);
+        std::map<std::string, std::vector<int>> tetByGrp, pyrByGrp;
+        for (int g = 0; g < (int)polySubElems.size(); ++g)
+        {
+            const std::string& k = grp[polySubElemCell[g]];
+            (polySubElems[g].type == 'T' ? tetByGrp : pyrByGrp)[k].push_back(g);
+        }
+        for (auto& [k, gids] : tetByGrp)
+        {
+            BlockInfo block;
+            block.name = getBlockName(k + "-poly-tet");
+            block.cellType = "tet";
+            block.decomposed = true;
+            block.subIndices = std::move(gids);
+            blocks.push_back(std::move(block));
+        }
+        for (auto& [k, gids] : pyrByGrp)
+        {
+            BlockInfo block;
+            block.name = getBlockName(k + "-poly-pyr");
+            block.cellType = "pyr";
+            block.decomposed = true;
+            block.subIndices = std::move(gids);
+            blocks.push_back(std::move(block));
+        }
+    }
+
     int blockId = 1;
     for (const auto& block : blocks)
     {
-        int numElemsInBlock = block.cellIndices.size();
+        int numElemsInBlock =
+            block.decomposed ? (int)block.subIndices.size()
+                             : (int)block.cellIndices.size();
 
         int numNodesPerElem = 8;
         std::string exoType = "HEX8";
@@ -1576,62 +1935,57 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
     {
         std::vector<int> connectivity;
 
-        for (int cellIdx : block.cellIndices)
+        if (block.decomposed)
         {
-            cellToExodusElem[cellIdx] = nextExodusElem++;
-
-            const auto& cell = cells[cellIdx];
-
-            std::vector<int> nodes;
-            if (block.cellType == "hex")
+            for (int gid : block.subIndices)
             {
-                nodes = orderHexNodes(cell, faces, points);
-            }
-            else if (block.cellType == "tet")
-            {
-                nodes = orderTetNodes(cell, faces, points);
-            }
-            else if (block.cellType == "pyr")
-            {
-                nodes = orderPyramidNodes(cell, faces, points);
-            }
-            else if (block.cellType == "wedge")
-            {
-                nodes = orderWedgeNodes(cell, faces, points);
-            }
-            else
-            {
-                std::set<int> nodeSet;
-                for (int faceIdx : cell.faceIndices)
-                {
-                    if (faceIdx >= 0 && faceIdx < (int)faces.size())
-                    {
-                        for (int nodeIdx : faces[faceIdx].pointIndices)
-                        {
-                            nodeSet.insert(nodeIdx);
-                        }
-                    }
-                }
-                nodes.assign(nodeSet.begin(), nodeSet.end());
-            }
-
-            int numNodesPerElem = (block.cellType == "tet")     ? 4
-                                  : (block.cellType == "pyr")   ? 5
-                                  : (block.cellType == "wedge") ? 6
-                                                                : 8;
-            if ((int)nodes.size() != numNodesPerElem)
-            {
-                std::cerr << "Warning: cell " << cellIdx
-                          << " (type=" << block.cellType << ") returned "
-                          << nodes.size() << " nodes, expected "
-                          << numNodesPerElem << std::endl;
-            }
-            for (int i = 0; i < numNodesPerElem; ++i)
-            {
-                connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
-                                                             : 1);
+                polySubElemExoId[gid] = nextExodusElem++;
+                for (int n : polySubElems[gid].nodes)
+                    connectivity.push_back(n + 1);
             }
         }
+        else
+            for (int cellIdx : block.cellIndices)
+            {
+                cellToExodusElem[cellIdx] = nextExodusElem++;
+
+                const auto& cell = cells[cellIdx];
+
+                std::vector<int> nodes;
+                if (block.cellType == "hex")
+                {
+                    nodes = orderHexNodes(cell, faces, points);
+                }
+                else if (block.cellType == "tet")
+                {
+                    nodes = orderTetNodes(cell, faces, points);
+                }
+                else if (block.cellType == "pyr")
+                {
+                    nodes = orderPyramidNodes(cell, faces, points);
+                }
+                else if (block.cellType == "wedge")
+                {
+                    nodes = orderWedgeNodes(cell, faces, points);
+                }
+
+                int numNodesPerElem = (block.cellType == "tet")     ? 4
+                                      : (block.cellType == "pyr")   ? 5
+                                      : (block.cellType == "wedge") ? 6
+                                                                    : 8;
+                if ((int)nodes.size() != numNodesPerElem)
+                {
+                    std::cerr << "Warning: cell " << cellIdx
+                              << " (type=" << block.cellType << ") returned "
+                              << nodes.size() << " nodes, expected "
+                              << numNodesPerElem << std::endl;
+                }
+                for (int i = 0; i < numNodesPerElem; ++i)
+                {
+                    connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
+                                                                 : 1);
+                }
+            }
 
         int var_id;
         nc_inq_varid(
@@ -1660,7 +2014,10 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         nc_put_vara_text(ncid, var_eb_names, start, count, name_buffer);
 
         std::cout << "Wrote element block " << blockId << " (" << block.name
-                  << ") with " << block.cellIndices.size() << " elements"
+                  << ") with "
+                  << (block.decomposed ? block.subIndices.size()
+                                       : block.cellIndices.size())
+                  << " elements"
                   << std::endl;
 
         blockId++;
@@ -1681,44 +2038,76 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         return;
     }
 
+    // Ordered nodes for standard cells only; polyhedral cells resolve their
+    // boundary faces through polyFaceToSubs instead.
     std::map<int, std::vector<int>> cellToOrderedNodes;
     for (size_t i = 0; i < cells.size(); ++i)
     {
         const auto& cell = cells[i];
-        std::vector<int> orderedNodes;
-
         if (cell.type == "hex")
-        {
-            orderedNodes = orderHexNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderHexNodes(cell, faces, points);
         else if (cell.type == "tet")
-        {
-            orderedNodes = orderTetNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderTetNodes(cell, faces, points);
         else if (cell.type == "pyr")
-        {
-            orderedNodes = orderPyramidNodes(cell, faces, points);
-        }
+            cellToOrderedNodes[i] = orderPyramidNodes(cell, faces, points);
         else if (cell.type == "wedge")
+            cellToOrderedNodes[i] = orderWedgeNodes(cell, faces, points);
+    }
+
+    // Build each patch's (elem, side) entries first. A boundary face of a
+    // polyhedral cell maps to the base side(s) of its sub-element(s); for an
+    // n-gon face that is several sides, so the per-sideset count is not known
+    // until the faces are walked.
+    std::vector<std::vector<int>> patchElem(patches.size());
+    std::vector<std::vector<int>> patchSide(patches.size());
+    for (size_t i = 0; i < patches.size(); ++i)
+    {
+        const auto& patch = patches[i];
+        auto& elem_list = patchElem[i];
+        auto& side_list = patchSide[i];
+
+        for (int j = 0; j < patch.nFaces; ++j)
         {
-            orderedNodes = orderWedgeNodes(cell, faces, points);
-        }
-        else
-        {
-            std::set<int> nodeSet;
-            for (int faceIdx : cell.faceIndices)
+            int faceIdx = patch.startFace + j;
+            if (faceIdx >= (int)owner.size())
+                continue;
+
+            auto pit = polyFaceToSubs.find(faceIdx);
+            if (pit != polyFaceToSubs.end())
             {
-                if (faceIdx >= 0 && faceIdx < (int)faces.size())
+                for (const auto& entry : pit->second)
                 {
-                    for (int nodeIdx : faces[faceIdx].pointIndices)
-                    {
-                        nodeSet.insert(nodeIdx);
-                    }
+                    elem_list.push_back(polySubElemExoId[entry.first]);
+                    side_list.push_back(entry.second);
                 }
+                continue;
             }
-            orderedNodes.assign(nodeSet.begin(), nodeSet.end());
+
+            int cellIdx = owner[faceIdx];
+            int exoId =
+                (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
+                    ? cellToExodusElem[cellIdx]
+                    : (cellIdx + 1);
+
+            const auto& face = faces[faceIdx];
+            const auto& cell = cells[cellIdx];
+            int sideId = 1;
+            auto cit = cellToOrderedNodes.find(cellIdx);
+            if (cit != cellToOrderedNodes.end())
+            {
+                const auto& ordNodes = cit->second;
+                if (cell.type == "hex")
+                    sideId = getHexFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "tet")
+                    sideId = getTetFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "pyr")
+                    sideId = getPyramidFaceId(face.pointIndices, ordNodes);
+                else if (cell.type == "wedge")
+                    sideId = getWedgeFaceId(face.pointIndices, ordNodes);
+            }
+            elem_list.push_back(exoId);
+            side_list.push_back(sideId);
         }
-        cellToOrderedNodes[i] = orderedNodes;
     }
 
     nc_redef(ncid);
@@ -1731,7 +2120,7 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         int dim_num_side_ss;
         nc_def_dim(ncid,
                    ("num_side_ss" + ss_num).c_str(),
-                   patch.nFaces,
+                   patchElem[i].size(),
                    &dim_num_side_ss);
 
         int var_elem_ss, var_side_ss;
@@ -1777,42 +2166,8 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         const auto& patch = patches[i];
         std::string ss_num = std::to_string(i + 1);
 
-        std::vector<int> elem_list, side_list;
-        elem_list.reserve(patch.nFaces);
-        side_list.reserve(patch.nFaces);
-
-        for (int j = 0; j < patch.nFaces; ++j)
-        {
-            int faceIdx = patch.startFace + j;
-            if (faceIdx < (int)owner.size())
-            {
-                int cellIdx = owner[faceIdx];
-                int exoId =
-                    (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
-                        ? cellToExodusElem[cellIdx]
-                        : (cellIdx + 1);
-                elem_list.push_back(exoId);
-
-                const auto& face = faces[faceIdx];
-                const auto& cell = cells[cellIdx];
-                int sideId = 1;
-
-                if (cellToOrderedNodes.count(cellIdx))
-                {
-                    const auto& ordNodes = cellToOrderedNodes[cellIdx];
-                    if (cell.type == "hex")
-                        sideId = getHexFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "tet")
-                        sideId = getTetFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "pyr")
-                        sideId = getPyramidFaceId(face.pointIndices, ordNodes);
-                    else if (cell.type == "wedge")
-                        sideId = getWedgeFaceId(face.pointIndices, ordNodes);
-                }
-
-                side_list.push_back(sideId);
-            }
-        }
+        const std::vector<int>& elem_list = patchElem[i];
+        const std::vector<int>& side_list = patchSide[i];
 
         int var_id;
         nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
@@ -1843,7 +2198,8 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         nc_put_vara_text(ncid, var_id, start, count, name_padded);
 
         std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
-                  << " with " << patch.nFaces << " faces" << std::endl;
+                  << " with " << elem_list.size() << " sides ("
+                  << patch.nFaces << " boundary faces)" << std::endl;
     }
 }
 

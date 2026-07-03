@@ -156,6 +156,11 @@ Boundary patches from OpenFOAM are automatically exported as sidesets in the Exo
 - Hexahedra (hex)
 - Tetrahedra (tet)
 - Pyramids (pyramid)
+- Prisms/wedges (wedge)
+- Arbitrary polyhedra (e.g. cfMesh hex cells with hanging nodes): split into
+  conformal tetrahedra/pyramids via a per-cell centroid and shared per-face
+  centroids, so the result is watertight and every element has positive volume.
+  Any standard cell whose ordering would be inverted is decomposed the same way.
 
 ### Mesh Components
 - Points (vertices)

@@ -47,6 +47,44 @@ private:
     // to the correct Exodus element.
     std::vector<int> cellToExodusElem;
 
+    // Polyhedral ("unknown") cells cannot be written as a standard Exodus
+    // element, so they are split into conformal tets/pyramids. A tri face
+    // becomes a tet, a quad face a pyramid, and an n-gon face a fan of tets
+    // around a shared per-face centroid; the apex is a per-cell centroid.
+    struct SubElem
+    {
+        char type;               // 'T' tet, 'P' pyramid
+        std::vector<int> nodes;  // 0-based indices into base + extra points
+    };
+    std::vector<Point> polyExtraPoints;  // appended after the reader points
+    std::vector<SubElem> polySubElems;
+    // Originating cell index of each sub-element, so decomposed elements can be
+    // grouped into per-region (zone/mesh) blocks rather than one global block.
+    std::vector<int> polySubElemCell;
+    // Per cell: 1 if the cell is split into sub-elements instead of being
+    // written as a standard element. True for "unknown" cells and for any
+    // standard cell whose ordering would produce a non-positive volume.
+    std::vector<char> cellDecomposed;
+
+    // cellIdx -> block group name (zone name, "unzoned", or "fluid"), matching
+    // how standard cells are grouped so poly blocks align with them.
+    std::vector<std::string> buildCellGroups(
+        const std::vector<Cell>& cells,
+        const std::vector<CellZone>& cellZones) const;
+    // 1-based Exodus element ID of each sub-element, filled while writing
+    // connectivity and consumed by writeSideSets.
+    std::vector<int> polySubElemExoId;
+    // Boundary face index -> (sub-element index, local side id) entries so a
+    // boundary face of a polyhedral cell resolves to the sub-element side(s)
+    // that actually carry it (an n-gon face yields several entries).
+    std::map<int, std::vector<std::pair<int, int>>> polyFaceToSubs;
+
+    void buildPolyDecomposition(const std::vector<Point>& points,
+                                const std::vector<Face>& faces,
+                                const std::vector<Cell>& cells,
+                                const std::vector<int>& owner,
+                                int boundaryStart);
+
     void initializeExodusFile(int numNodes,
                               int numElems,
                               int numElemBlocks,
