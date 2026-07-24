@@ -256,10 +256,6 @@ formula, the same one ParaView reports. A cell that fails is named in the
 message by its OpenFOAM cell ID; if no valid element can be produced at all the
 conversion fails rather than writing an inverted or collapsed element.
 
-Each element carries the Exodus attribute `source_openfoam_cell_id`. Elements
-produced by decomposing a cell also carry `source_openfoam_face_id` and
-`source_sub_element_index`, so any element maps back to its source cell.
-
 ### Mesh Components
 - Points (vertices)
 - Faces

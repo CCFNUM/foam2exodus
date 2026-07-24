@@ -136,13 +136,6 @@ private:
     template <typename ReaderType>
     void writeSideSetsImpl(const ReaderType& reader);
 
-    // Per-element provenance written as static Exodus element attributes.
-    static const std::vector<std::string>& standardAttribNames();
-    static const std::vector<std::string>& decomposedAttribNames();
-    void writeBlockAttributes(int blockId,
-                              bool decomposed,
-                              const std::vector<double>& values);
-
     void writeElements(const OpenFOAMMeshReader& reader);
     void writeSideSets(const OpenFOAMMeshReader& reader);
     void writeElements(const MergedMeshReader& reader);

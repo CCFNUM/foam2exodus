@@ -1019,55 +1019,6 @@ void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
     }
 }
 
-// Names of the per-element attributes that trace an Exodus element back to the
-// OpenFOAM cell it came from. One-to-one elements carry the source cell ID
-// only; sub-elements of a decomposed cell also carry the face they were built
-// on and their index within that face.
-const std::vector<std::string>& ExodusWriter::standardAttribNames()
-{
-    static const std::vector<std::string> names{"source_openfoam_cell_id"};
-    return names;
-}
-
-const std::vector<std::string>& ExodusWriter::decomposedAttribNames()
-{
-    static const std::vector<std::string> names{"source_openfoam_cell_id",
-                                                "source_openfoam_face_id",
-                                                "source_sub_element_index"};
-    return names;
-}
-
-void ExodusWriter::writeBlockAttributes(int blockId,
-                                        bool decomposed,
-                                        const std::vector<double>& values)
-{
-    const std::string blk_num = std::to_string(blockId);
-    const std::vector<std::string>& names =
-        decomposed ? decomposedAttribNames() : standardAttribNames();
-
-    int var_id;
-    checkError(nc_inq_varid(ncid, ("attrib" + blk_num).c_str(), &var_id),
-               "Failed to get element attribute variable");
-    if (!values.empty())
-    {
-        checkError(nc_put_var_double(ncid, var_id, values.data()),
-                   "Failed to write element attributes");
-    }
-
-    checkError(nc_inq_varid(ncid, ("attrib_name" + blk_num).c_str(), &var_id),
-               "Failed to get element attribute name variable");
-    for (size_t i = 0; i < names.size(); ++i)
-    {
-        char buffer[33];
-        std::memset(buffer, 0, sizeof(buffer));
-        std::strncpy(buffer, names[i].c_str(), 32);
-        size_t start[2] = {i, 0};
-        size_t count[2] = {1, 33};
-        checkError(nc_put_vara_text(ncid, var_id, start, count, buffer),
-                   "Failed to write element attribute name");
-    }
-}
-
 void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 {
     const auto& cells = reader.getCells();
@@ -1188,10 +1139,6 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         }
     }
 
-    int dim_len_name;
-    checkError(nc_inq_dimid(ncid, "len_name", &dim_len_name),
-               "Failed to get len_name dimension");
-
     int blockId = 1;
     for (const auto& block : blocks)
     {
@@ -1252,37 +1199,6 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
             ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
         checkError(status, "Failed to set element type attribute");
 
-        // Per-element attributes carrying the source-cell provenance. They are
-        // static Exodus attributes rather than transient element variables, so
-        // a pure mesh file stays free of time steps.
-        const std::vector<std::string>& attNames =
-            block.decomposed ? decomposedAttribNames() : standardAttribNames();
-        int dim_num_att;
-        status = nc_def_dim(ncid,
-                            ("num_att_in_blk" + blk_num).c_str(),
-                            attNames.size(),
-                            &dim_num_att);
-        checkError(status, "Failed to define element attribute dimension");
-
-        int var_attrib, var_attrib_name;
-        int dims_attrib[2] = {dim_num_el_in_blk, dim_num_att};
-        status = nc_def_var(ncid,
-                            ("attrib" + blk_num).c_str(),
-                            NC_DOUBLE,
-                            2,
-                            dims_attrib,
-                            &var_attrib);
-        checkError(status, "Failed to define element attribute variable");
-
-        int dims_attrib_name[2] = {dim_num_att, dim_len_name};
-        status = nc_def_var(ncid,
-                            ("attrib_name" + blk_num).c_str(),
-                            NC_CHAR,
-                            2,
-                            dims_attrib_name,
-                            &var_attrib_name);
-        checkError(status, "Failed to define element attribute name variable");
-
         blockId++;
     }
 
@@ -1295,8 +1211,6 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
     for (const auto& block : blocks)
     {
         std::vector<int> connectivity;
-        std::vector<double> attribSource;
-
         if (block.decomposed)
         {
             for (int gid : block.subIndices)
@@ -1304,17 +1218,12 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
                 polySubElemExoId[gid] = nextExodusElem++;
                 for (int n : polySubElems[gid].nodes)
                     connectivity.push_back(n + 1);
-                attribSource.push_back(polySubElemCell[gid]);
-                attribSource.push_back(polySubElems[gid].srcFace);
-                attribSource.push_back(polySubElems[gid].srcSub);
             }
         }
         else
             for (int cellIdx : block.cellIndices)
             {
                 cellToExodusElem[cellIdx] = nextExodusElem++;
-                attribSource.push_back(cellIdx);
-
                 // Connectivity was matched and validated up front, so it is
                 // reused verbatim here and in the side sets.
                 const std::vector<int>& nodes = cellOrderedNodes[cellIdx];
@@ -1342,8 +1251,6 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         nc_inq_varid(
             ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, connectivity.data());
-
-        writeBlockAttributes(blockId, block.decomposed, attribSource);
 
         int eb_status = 1;
         int var_status;
@@ -2697,10 +2604,6 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         }
     }
 
-    int dim_len_name;
-    checkError(nc_inq_dimid(ncid, "len_name", &dim_len_name),
-               "Failed to get len_name dimension");
-
     int blockId = 1;
     for (const auto& block : blocks)
     {
@@ -2761,37 +2664,6 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
             ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
         checkError(status, "Failed to set element type attribute");
 
-        // Per-element attributes carrying the source-cell provenance. They are
-        // static Exodus attributes rather than transient element variables, so
-        // a pure mesh file stays free of time steps.
-        const std::vector<std::string>& attNames =
-            block.decomposed ? decomposedAttribNames() : standardAttribNames();
-        int dim_num_att;
-        status = nc_def_dim(ncid,
-                            ("num_att_in_blk" + blk_num).c_str(),
-                            attNames.size(),
-                            &dim_num_att);
-        checkError(status, "Failed to define element attribute dimension");
-
-        int var_attrib, var_attrib_name;
-        int dims_attrib[2] = {dim_num_el_in_blk, dim_num_att};
-        status = nc_def_var(ncid,
-                            ("attrib" + blk_num).c_str(),
-                            NC_DOUBLE,
-                            2,
-                            dims_attrib,
-                            &var_attrib);
-        checkError(status, "Failed to define element attribute variable");
-
-        int dims_attrib_name[2] = {dim_num_att, dim_len_name};
-        status = nc_def_var(ncid,
-                            ("attrib_name" + blk_num).c_str(),
-                            NC_CHAR,
-                            2,
-                            dims_attrib_name,
-                            &var_attrib_name);
-        checkError(status, "Failed to define element attribute name variable");
-
         blockId++;
     }
 
@@ -2804,8 +2676,6 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
     for (const auto& block : blocks)
     {
         std::vector<int> connectivity;
-        std::vector<double> attribSource;
-
         if (block.decomposed)
         {
             for (int gid : block.subIndices)
@@ -2813,17 +2683,12 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
                 polySubElemExoId[gid] = nextExodusElem++;
                 for (int n : polySubElems[gid].nodes)
                     connectivity.push_back(n + 1);
-                attribSource.push_back(polySubElemCell[gid]);
-                attribSource.push_back(polySubElems[gid].srcFace);
-                attribSource.push_back(polySubElems[gid].srcSub);
             }
         }
         else
             for (int cellIdx : block.cellIndices)
             {
                 cellToExodusElem[cellIdx] = nextExodusElem++;
-                attribSource.push_back(cellIdx);
-
                 // Connectivity was matched and validated up front, so it is
                 // reused verbatim here and in the side sets.
                 const std::vector<int>& nodes = cellOrderedNodes[cellIdx];
@@ -2851,8 +2716,6 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         nc_inq_varid(
             ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, connectivity.data());
-
-        writeBlockAttributes(blockId, block.decomposed, attribSource);
 
         int eb_status = 1;
         int var_status;
