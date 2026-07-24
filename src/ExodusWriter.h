@@ -17,6 +17,8 @@
 
 // Forward declaration for MergedMeshReader
 class MergedMeshReader;
+class OpenFOAMFieldReader;
+struct VolFieldInfo;
 
 class ExodusWriter
 {
@@ -28,6 +30,10 @@ public:
     void writeMesh(const OpenFOAMMeshReader& reader,
                    const std::map<std::string, std::string>& elementBlockNames,
                    const std::map<std::string, std::string>& sidesetNames);
+    void writeNodalFields(const OpenFOAMMeshReader& reader,
+                          const OpenFOAMFieldReader& fieldReader,
+                          const std::vector<VolFieldInfo>& fields,
+                          double timeValue);
 
     // Overloads for MergedMeshReader
     void writeMesh(const MergedMeshReader& reader);

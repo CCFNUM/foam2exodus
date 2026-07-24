@@ -8,10 +8,14 @@
 
 #include "ExodusWriter.h"
 #include "MergedMeshReader.h"
+#include "OpenFOAMFieldReader.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -1720,6 +1724,713 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
     writeSideSets(reader);
 
     std::cout << "Successfully wrote Exodus II file: " << filename << std::endl;
+}
+
+namespace
+{
+
+struct DualContribution
+{
+    int node = -1;
+    double volume = 0.0;
+    Point firstMoment{0.0, 0.0, 0.0};
+};
+
+Point addPoint(const Point& a, const Point& b)
+{
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Point subtractPoint(const Point& a, const Point& b)
+{
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Point scalePoint(const Point& a, double scale)
+{
+    return {a.x * scale, a.y * scale, a.z * scale};
+}
+
+double dotPoint(const Point& a, const Point& b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Point crossPoint(const Point& a, const Point& b)
+{
+    return {
+        a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+double squaredMagnitude(const Point& a)
+{
+    return dotPoint(a, a);
+}
+
+Point geometricFaceCentre(const Face& face, const std::vector<Point>& points)
+{
+    Point vertexMean{0.0, 0.0, 0.0};
+    for (int node : face.pointIndices)
+        vertexMean = addPoint(vertexMean, points[node]);
+    vertexMean = scalePoint(
+        vertexMean, 1.0 / static_cast<double>(face.pointIndices.size()));
+
+    Point weightedCentre{0.0, 0.0, 0.0};
+    double totalArea = 0.0;
+    for (size_t edge = 0; edge < face.pointIndices.size(); ++edge)
+    {
+        const Point& a = points[face.pointIndices[edge]];
+        const Point& b =
+            points[face.pointIndices[(edge + 1) % face.pointIndices.size()]];
+        const double twiceArea = std::sqrt(squaredMagnitude(crossPoint(
+            subtractPoint(a, vertexMean), subtractPoint(b, vertexMean))));
+        const Point triangleCentre =
+            scalePoint(addPoint(addPoint(vertexMean, a), b), 1.0 / 3.0);
+        weightedCentre =
+            addPoint(weightedCentre, scalePoint(triangleCentre, twiceArea));
+        totalArea += twiceArea;
+    }
+    if (totalArea <= std::numeric_limits<double>::min())
+        return vertexMean;
+    return scalePoint(weightedCentre, 1.0 / totalArea);
+}
+
+std::vector<std::vector<int>> elementFaceNodes(const std::string& type,
+                                               const std::vector<int>& nodes)
+{
+    auto face = [&](std::initializer_list<int> local)
+    {
+        std::vector<int> result;
+        result.reserve(local.size());
+        for (int index : local)
+            result.push_back(nodes[index]);
+        return result;
+    };
+
+    if (type == "tet")
+        return {
+            face({0, 1, 3}), face({1, 2, 3}), face({2, 0, 3}), face({0, 2, 1})};
+    if (type == "pyr")
+        return {face({0, 1, 4}),
+                face({1, 2, 4}),
+                face({2, 3, 4}),
+                face({3, 0, 4}),
+                face({0, 3, 2, 1})};
+    if (type == "wedge")
+        return {face({0, 1, 4, 3}),
+                face({1, 2, 5, 4}),
+                face({2, 0, 3, 5}),
+                face({0, 2, 1}),
+                face({3, 4, 5})};
+    if (type == "hex")
+        return {face({0, 1, 5, 4}),
+                face({1, 2, 6, 5}),
+                face({2, 3, 7, 6}),
+                face({3, 0, 4, 7}),
+                face({0, 3, 2, 1}),
+                face({4, 5, 6, 7})};
+    throw std::runtime_error("Unsupported element type in field projection: " +
+                             type);
+}
+
+bool projectionUsesPatch(const BoundaryPatch& patch)
+{
+    std::string type = patch.type;
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return type.find("cyclic") == std::string::npos &&
+           type.find("processor") == std::string::npos && type != "empty";
+}
+
+// Moore-Penrose inverse of a symmetric positive-semidefinite 3x3 matrix.
+// Rank-deficient directions (notably the empty direction of a 2-D mesh) are
+// intentionally discarded.
+std::array<double, 6>
+symmetricPseudoInverse(const std::array<double, 6>& packed)
+{
+    double a[3][3] = {{packed[0], packed[1], packed[2]},
+                      {packed[1], packed[3], packed[4]},
+                      {packed[2], packed[4], packed[5]}};
+    double vectors[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        int p = 0, q = 1;
+        double largest = std::abs(a[0][1]);
+        if (std::abs(a[0][2]) > largest)
+        {
+            p = 0;
+            q = 2;
+            largest = std::abs(a[0][2]);
+        }
+        if (std::abs(a[1][2]) > largest)
+        {
+            p = 1;
+            q = 2;
+            largest = std::abs(a[1][2]);
+        }
+        if (largest <= 1e-14)
+            break;
+
+        const double angle = 0.5 * std::atan2(2.0 * a[p][q], a[q][q] - a[p][p]);
+        const double c = std::cos(angle);
+        const double s = std::sin(angle);
+
+        const double app = a[p][p];
+        const double aqq = a[q][q];
+        const double apq = a[p][q];
+        for (int k = 0; k < 3; ++k)
+        {
+            if (k == p || k == q)
+                continue;
+            const double akp = a[k][p];
+            const double akq = a[k][q];
+            a[k][p] = a[p][k] = c * akp - s * akq;
+            a[k][q] = a[q][k] = s * akp + c * akq;
+        }
+        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        a[p][q] = a[q][p] = 0.0;
+
+        for (int k = 0; k < 3; ++k)
+        {
+            const double vkp = vectors[k][p];
+            const double vkq = vectors[k][q];
+            vectors[k][p] = c * vkp - s * vkq;
+            vectors[k][q] = s * vkp + c * vkq;
+        }
+    }
+
+    const double maximum =
+        std::max({std::abs(a[0][0]), std::abs(a[1][1]), std::abs(a[2][2])});
+    const double tolerance = maximum * 1e-10;
+    double inverse[3][3] = {};
+    for (int eigen = 0; eigen < 3; ++eigen)
+    {
+        if (a[eigen][eigen] <= tolerance)
+            continue;
+        const double reciprocal = 1.0 / a[eigen][eigen];
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                inverse[row][column] +=
+                    reciprocal * vectors[row][eigen] * vectors[column][eigen];
+    }
+    return {inverse[0][0],
+            inverse[0][1],
+            inverse[0][2],
+            inverse[1][1],
+            inverse[1][2],
+            inverse[2][2]};
+}
+
+Point multiplySymmetric(const std::array<double, 6>& matrix, const Point& rhs)
+{
+    return {matrix[0] * rhs.x + matrix[1] * rhs.y + matrix[2] * rhs.z,
+            matrix[1] * rhs.x + matrix[3] * rhs.y + matrix[4] * rhs.z,
+            matrix[2] * rhs.x + matrix[4] * rhs.y + matrix[5] * rhs.z};
+}
+
+void addOuterProduct(std::array<double, 6>& matrix, const Point& direction)
+{
+    const double distanceSquared = squaredMagnitude(direction);
+    if (distanceSquared <= std::numeric_limits<double>::min())
+        return;
+    const double weight = 1.0 / distanceSquared;
+    matrix[0] += weight * direction.x * direction.x;
+    matrix[1] += weight * direction.x * direction.y;
+    matrix[2] += weight * direction.x * direction.z;
+    matrix[3] += weight * direction.y * direction.y;
+    matrix[4] += weight * direction.y * direction.z;
+    matrix[5] += weight * direction.z * direction.z;
+}
+
+void addLeastSquaresRhs(Point& rhs, const Point& direction, double difference)
+{
+    const double distanceSquared = squaredMagnitude(direction);
+    if (distanceSquared <= std::numeric_limits<double>::min())
+        return;
+    const double scale = difference / distanceSquared;
+    rhs.x += scale * direction.x;
+    rhs.y += scale * direction.y;
+    rhs.z += scale * direction.z;
+}
+
+double boundaryComponent(const VolField& field,
+                         const BoundaryPatch& patch,
+                         int localFace,
+                         int component,
+                         double ownerValue)
+{
+    const auto found = field.boundary.find(patch.name);
+    if (found == field.boundary.end() || !found->second.hasValues)
+        return ownerValue;
+    const size_t index =
+        static_cast<size_t>(localFace) * field.info.numComponents + component;
+    if (index >= found->second.values.size())
+        throw std::runtime_error("Boundary field '" + field.info.name +
+                                 "' has too few values on patch '" +
+                                 patch.name + "'");
+    return found->second.values[index];
+}
+
+void updateLimiter(double centreValue,
+                   double minimum,
+                   double maximum,
+                   const Point& gradient,
+                   const Point& direction,
+                   double& limiter)
+{
+    const double change = dotPoint(gradient, direction);
+    const double allowedChange = maximum - minimum;
+    const double scale = std::max(
+        {1.0, std::abs(centreValue), std::abs(minimum), std::abs(maximum)});
+    if (std::abs(change) > 1e-14 * scale)
+        limiter = std::min(limiter, allowedChange / std::abs(change));
+}
+
+} // namespace
+
+void ExodusWriter::writeNodalFields(const OpenFOAMMeshReader& reader,
+                                    const OpenFOAMFieldReader& fieldReader,
+                                    const std::vector<VolFieldInfo>& fields,
+                                    double timeValue)
+{
+    if (ncid < 0)
+        throw std::runtime_error(
+            "Cannot write fields before the Exodus mesh is open");
+    if (fields.empty())
+        return;
+
+    std::vector<Point> outputPoints = reader.getPoints();
+    outputPoints.insert(
+        outputPoints.end(), polyExtraPoints.begin(), polyExtraPoints.end());
+    const int numCells = reader.getNumCells();
+    const int numNodes = static_cast<int>(outputPoints.size());
+
+    std::cout << "\nBuilding conservative CVFEM nodal projection..."
+              << std::endl;
+
+    // Link decomposed sub-elements by their originating OpenFOAM cell without
+    // allocating one std::vector object per cell.
+    std::vector<int> polyHead(numCells, -1);
+    std::vector<int> polyNext(polySubElems.size(), -1);
+    for (int sub = 0; sub < (int)polySubElems.size(); ++sub)
+    {
+        const int cell = polySubElemCell[sub];
+        polyNext[sub] = polyHead[cell];
+        polyHead[cell] = sub;
+    }
+
+    std::vector<size_t> contributionOffset(numCells + 1, 0);
+    std::vector<DualContribution> contributions;
+    contributions.reserve(static_cast<size_t>(numCells) * 8);
+    std::vector<double> cellVolume(numCells, 0.0);
+    std::vector<Point> cellCentre(numCells, {0.0, 0.0, 0.0});
+    std::vector<double> nodalDualVolume(numNodes, 0.0);
+
+    for (int cell = 0; cell < numCells; ++cell)
+    {
+        std::vector<DualContribution> local;
+        auto addContribution =
+            [&](int node, double volume, const Point& centroid)
+        {
+            auto found = std::find_if(local.begin(),
+                                      local.end(),
+                                      [&](const DualContribution& entry)
+            { return entry.node == node; });
+            if (found == local.end())
+            {
+                local.push_back({node, 0.0, {0.0, 0.0, 0.0}});
+                found = local.end() - 1;
+            }
+            found->volume += volume;
+            found->firstMoment =
+                addPoint(found->firstMoment, scalePoint(centroid, volume));
+        };
+
+        auto addElement =
+            [&](const std::string& type, const std::vector<int>& nodes)
+        {
+            Point elementCentre{0.0, 0.0, 0.0};
+            for (int node : nodes)
+                elementCentre = addPoint(elementCentre, outputPoints[node]);
+            elementCentre = scalePoint(elementCentre,
+                                       1.0 / static_cast<double>(nodes.size()));
+
+            for (const std::vector<int>& face : elementFaceNodes(type, nodes))
+            {
+                Point faceCentre{0.0, 0.0, 0.0};
+                for (int node : face)
+                    faceCentre = addPoint(faceCentre, outputPoints[node]);
+                faceCentre = scalePoint(faceCentre,
+                                        1.0 / static_cast<double>(face.size()));
+
+                for (size_t edge = 0; edge < face.size(); ++edge)
+                {
+                    const int aNode = face[edge];
+                    const int bNode = face[(edge + 1) % face.size()];
+                    const Point& a = outputPoints[aNode];
+                    const Point& b = outputPoints[bNode];
+                    const double pyramidTetVolume =
+                        std::abs(dotPoint(
+                            subtractPoint(faceCentre, elementCentre),
+                            crossPoint(subtractPoint(a, elementCentre),
+                                       subtractPoint(b, elementCentre)))) /
+                        6.0;
+                    if (pyramidTetVolume <= std::numeric_limits<double>::min())
+                        continue;
+
+                    const Point midpoint = scalePoint(addPoint(a, b), 0.5);
+                    const Point centroidA =
+                        scalePoint(addPoint(addPoint(elementCentre, faceCentre),
+                                            addPoint(a, midpoint)),
+                                   0.25);
+                    const Point centroidB =
+                        scalePoint(addPoint(addPoint(elementCentre, faceCentre),
+                                            addPoint(midpoint, b)),
+                                   0.25);
+                    const double pieceVolume = 0.5 * pyramidTetVolume;
+                    addContribution(aNode, pieceVolume, centroidA);
+                    addContribution(bNode, pieceVolume, centroidB);
+                }
+            }
+        };
+
+        if (!cellDecomposed[cell])
+        {
+            addElement(reader.getCells()[cell].type, cellOrderedNodes[cell]);
+        }
+        else
+        {
+            for (int sub = polyHead[cell]; sub >= 0; sub = polyNext[sub])
+                addElement(polySubElems[sub].type == 'T' ? "tet" : "pyr",
+                           polySubElems[sub].nodes);
+        }
+
+        Point totalMoment{0.0, 0.0, 0.0};
+        for (const DualContribution& entry : local)
+        {
+            cellVolume[cell] += entry.volume;
+            totalMoment = addPoint(totalMoment, entry.firstMoment);
+        }
+        if (!(cellVolume[cell] > 0.0))
+            throw std::runtime_error(
+                "Cannot construct a positive dual volume for OpenFOAM cell " +
+                std::to_string(cell));
+        cellCentre[cell] = scalePoint(totalMoment, 1.0 / cellVolume[cell]);
+
+        contributionOffset[cell] = contributions.size();
+        for (const DualContribution& entry : local)
+        {
+            contributions.push_back(entry);
+            nodalDualVolume[entry.node] += entry.volume;
+        }
+        contributionOffset[cell + 1] = contributions.size();
+    }
+
+    for (int node = 0; node < numNodes; ++node)
+        if (!(nodalDualVolume[node] > 0.0))
+            throw std::runtime_error("Exodus node " + std::to_string(node + 1) +
+                                     " has zero CVFEM dual volume");
+
+    // OpenFOAM face centroids are the locations of the boundary values.
+    std::vector<Point> faceCentres(reader.getFaces().size());
+    for (size_t face = 0; face < reader.getFaces().size(); ++face)
+        faceCentres[face] =
+            geometricFaceCentre(reader.getFaces()[face], reader.getPoints());
+
+    // Geometry-only least-squares matrices are shared by every field.
+    std::vector<std::array<double, 6>> inverseLeastSquares(numCells);
+    const auto& owner = reader.getOwner();
+    const auto& neighbour = reader.getNeighbour();
+    for (size_t face = 0; face < neighbour.size(); ++face)
+    {
+        const int own = owner[face];
+        const int nei = neighbour[face];
+        const Point direction = subtractPoint(cellCentre[nei], cellCentre[own]);
+        addOuterProduct(inverseLeastSquares[own], direction);
+        addOuterProduct(inverseLeastSquares[nei], direction);
+    }
+    for (const BoundaryPatch& patch : reader.getBoundaryPatches())
+    {
+        if (!projectionUsesPatch(patch))
+            continue;
+        for (int localFace = 0; localFace < patch.nFaces; ++localFace)
+        {
+            const int face = patch.startFace + localFace;
+            const int cell = owner[face];
+            addOuterProduct(inverseLeastSquares[cell],
+                            subtractPoint(faceCentres[face], cellCentre[cell]));
+        }
+    }
+    for (std::array<double, 6>& matrix : inverseLeastSquares)
+        matrix = symmetricPseudoInverse(matrix);
+
+    struct NodalVariable
+    {
+        int field = 0;
+        int component = 0;
+        std::string name;
+        int netcdfId = -1;
+    };
+
+    std::vector<NodalVariable> variables;
+    std::set<std::string> usedNames;
+    for (int field = 0; field < (int)fields.size(); ++field)
+    {
+        for (int component = 0; component < fields[field].numComponents;
+             ++component)
+        {
+            std::string fullName = fields[field].outputName;
+            if (fields[field].numComponents > 1)
+                fullName += "_" + fields[field].componentNames[component];
+            std::string name = fullName.substr(0, 32);
+            if (!usedNames.insert(name).second)
+                throw std::runtime_error("Exodus nodal variable name collision "
+                                         "after the 32-character "
+                                         "limit: '" +
+                                         fullName + "'");
+            variables.push_back({field, component, name, -1});
+        }
+    }
+
+    checkError(nc_redef(ncid), "Failed to enter define mode for nodal fields");
+    int dimNodalVariables, dimName, dimTime, dimNodes;
+    checkError(
+        nc_def_dim(ncid, "num_nod_var", variables.size(), &dimNodalVariables),
+        "Failed to define num_nod_var");
+    checkError(nc_inq_dimid(ncid, "len_name", &dimName),
+               "Failed to find len_name");
+    checkError(nc_inq_dimid(ncid, "time_step", &dimTime),
+               "Failed to find time_step");
+    checkError(nc_inq_dimid(ncid, "num_nodes", &dimNodes),
+               "Failed to find num_nodes");
+
+    int nameVariable, timeVariable;
+    int nameDimensions[2] = {dimNodalVariables, dimName};
+    checkError(
+        nc_def_var(
+            ncid, "name_nod_var", NC_CHAR, 2, nameDimensions, &nameVariable),
+        "Failed to define nodal variable names");
+    checkError(
+        nc_def_var(ncid, "time_whole", NC_DOUBLE, 1, &dimTime, &timeVariable),
+        "Failed to define Exodus time");
+    const int valueDimensions[2] = {dimTime, dimNodes};
+    for (size_t variable = 0; variable < variables.size(); ++variable)
+    {
+        const std::string netcdfName =
+            "vals_nod_var" + std::to_string(variable + 1);
+        checkError(nc_def_var(ncid,
+                              netcdfName.c_str(),
+                              NC_DOUBLE,
+                              2,
+                              valueDimensions,
+                              &variables[variable].netcdfId),
+                   "Failed to define nodal variable " +
+                       variables[variable].name);
+    }
+    const char* projectionDescription =
+        "limited linear cell reconstruction integrated over median-dual "
+        "sub-control volumes; boundary face values enter reconstruction";
+    checkError(nc_put_att_text(ncid,
+                               NC_GLOBAL,
+                               "foam2exodus_nodal_projection",
+                               std::strlen(projectionDescription),
+                               projectionDescription),
+               "Failed to describe nodal projection");
+    checkError(nc_enddef(ncid), "Failed to leave nodal field define mode");
+
+    const size_t timeIndex = 0;
+    checkError(nc_put_var1_double(ncid, timeVariable, &timeIndex, &timeValue),
+               "Failed to write Exodus time");
+    for (size_t variable = 0; variable < variables.size(); ++variable)
+    {
+        char padded[33] = {};
+        std::strncpy(padded, variables[variable].name.c_str(), 32);
+        const size_t start[2] = {variable, 0};
+        const size_t count[2] = {1, 33};
+        checkError(nc_put_vara_text(ncid, nameVariable, start, count, padded),
+                   "Failed to write nodal variable name " +
+                       variables[variable].name);
+    }
+
+    size_t variableIndex = 0;
+    for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex)
+    {
+        std::cout << "  Reading field " << fields[fieldIndex].name << "..."
+                  << std::endl;
+        const VolField field = fieldReader.readField(fields[fieldIndex]);
+        if ((int)field.internalValues.size() !=
+            numCells * field.info.numComponents)
+            throw std::runtime_error("Internal size mismatch in field '" +
+                                     field.info.name + "'");
+
+        for (int component = 0; component < field.info.numComponents;
+             ++component, ++variableIndex)
+        {
+            auto cellValue = [&](int cell)
+            {
+                return field.internalValues[static_cast<size_t>(cell) *
+                                                field.info.numComponents +
+                                            component];
+            };
+
+            std::vector<Point> rhs(numCells, {0.0, 0.0, 0.0});
+            std::vector<double> minimum(numCells), maximum(numCells);
+            for (int cell = 0; cell < numCells; ++cell)
+                minimum[cell] = maximum[cell] = cellValue(cell);
+
+            for (size_t face = 0; face < neighbour.size(); ++face)
+            {
+                const int own = owner[face];
+                const int nei = neighbour[face];
+                const double ownValue = cellValue(own);
+                const double neiValue = cellValue(nei);
+                const Point direction =
+                    subtractPoint(cellCentre[nei], cellCentre[own]);
+                addLeastSquaresRhs(rhs[own], direction, neiValue - ownValue);
+                addLeastSquaresRhs(rhs[nei], direction, neiValue - ownValue);
+                minimum[own] = std::min(minimum[own], neiValue);
+                maximum[own] = std::max(maximum[own], neiValue);
+                minimum[nei] = std::min(minimum[nei], ownValue);
+                maximum[nei] = std::max(maximum[nei], ownValue);
+            }
+            for (const BoundaryPatch& patch : reader.getBoundaryPatches())
+            {
+                if (!projectionUsesPatch(patch))
+                    continue;
+                for (int localFace = 0; localFace < patch.nFaces; ++localFace)
+                {
+                    const int face = patch.startFace + localFace;
+                    const int cell = owner[face];
+                    const double centreValue = cellValue(cell);
+                    const double faceValue = boundaryComponent(
+                        field, patch, localFace, component, centreValue);
+                    addLeastSquaresRhs(
+                        rhs[cell],
+                        subtractPoint(faceCentres[face], cellCentre[cell]),
+                        faceValue - centreValue);
+                    minimum[cell] = std::min(minimum[cell], faceValue);
+                    maximum[cell] = std::max(maximum[cell], faceValue);
+                }
+            }
+
+            std::vector<Point> gradient(numCells);
+            for (int cell = 0; cell < numCells; ++cell)
+                gradient[cell] =
+                    multiplySymmetric(inverseLeastSquares[cell], rhs[cell]);
+
+            // Bound the reconstructed change over every stencil direction by
+            // the full range present in that stencil. A one-sided fixed
+            // boundary necessarily requires compensation toward the cell
+            // interior if the stored cell average is to remain unchanged, so
+            // a conventional one-sided extrema limiter would incorrectly
+            // suppress all boundary influence. Scaling the gradient leaves
+            // the cell average, and therefore conservation, unchanged.
+            std::vector<double> limiter(numCells, 1.0);
+            for (size_t face = 0; face < neighbour.size(); ++face)
+            {
+                const int own = owner[face];
+                const int nei = neighbour[face];
+                const Point direction =
+                    subtractPoint(cellCentre[nei], cellCentre[own]);
+                updateLimiter(cellValue(own),
+                              minimum[own],
+                              maximum[own],
+                              gradient[own],
+                              direction,
+                              limiter[own]);
+                updateLimiter(cellValue(nei),
+                              minimum[nei],
+                              maximum[nei],
+                              gradient[nei],
+                              scalePoint(direction, -1.0),
+                              limiter[nei]);
+            }
+            for (const BoundaryPatch& patch : reader.getBoundaryPatches())
+            {
+                if (!projectionUsesPatch(patch))
+                    continue;
+                for (int localFace = 0; localFace < patch.nFaces; ++localFace)
+                {
+                    const int face = patch.startFace + localFace;
+                    const int cell = owner[face];
+                    updateLimiter(
+                        cellValue(cell),
+                        minimum[cell],
+                        maximum[cell],
+                        gradient[cell],
+                        subtractPoint(faceCentres[face], cellCentre[cell]),
+                        limiter[cell]);
+                }
+            }
+            for (int cell = 0; cell < numCells; ++cell)
+            {
+                limiter[cell] = std::max(0.0, std::min(1.0, limiter[cell]));
+                gradient[cell] = scalePoint(gradient[cell], limiter[cell]);
+            }
+
+            std::vector<double> numerator(numNodes, 0.0);
+            long double sourceIntegral = 0.0L;
+            long double integralScale = 0.0L;
+            for (int cell = 0; cell < numCells; ++cell)
+            {
+                const double value = cellValue(cell);
+                sourceIntegral +=
+                    static_cast<long double>(cellVolume[cell]) * value;
+                integralScale += std::abs(
+                    static_cast<long double>(cellVolume[cell]) * value);
+                for (size_t index = contributionOffset[cell];
+                     index < contributionOffset[cell + 1];
+                     ++index)
+                {
+                    const DualContribution& entry = contributions[index];
+                    const Point relativeMoment = subtractPoint(
+                        entry.firstMoment,
+                        scalePoint(cellCentre[cell], entry.volume));
+                    numerator[entry.node] +=
+                        entry.volume * value +
+                        dotPoint(gradient[cell], relativeMoment);
+                }
+            }
+
+            std::vector<double> nodalValue(numNodes);
+            long double projectedIntegral = 0.0L;
+            for (int node = 0; node < numNodes; ++node)
+            {
+                nodalValue[node] = numerator[node] / nodalDualVolume[node];
+                projectedIntegral += numerator[node];
+            }
+
+            const size_t start[2] = {0, 0};
+            const size_t count[2] = {1, static_cast<size_t>(numNodes)};
+            checkError(nc_put_vara_double(ncid,
+                                          variables[variableIndex].netcdfId,
+                                          start,
+                                          count,
+                                          nodalValue.data()),
+                       "Failed to write nodal variable " +
+                           variables[variableIndex].name);
+
+            const long double error =
+                std::abs(projectedIntegral - sourceIntegral);
+            const long double relative =
+                error / std::max(integralScale,
+                                 static_cast<long double>(
+                                     std::numeric_limits<double>::min()));
+            std::cout << "    " << variables[variableIndex].name
+                      << ": conservative integral relative error "
+                      << std::scientific << std::setprecision(3)
+                      << static_cast<double>(relative) << std::defaultfloat
+                      << std::endl;
+        }
+    }
+
+    checkError(nc_sync(ncid), "Failed to flush Exodus nodal fields");
+    std::cout << "Wrote " << variables.size()
+              << " conservative nodal variable(s) at OpenFOAM time "
+              << fieldReader.getTimeName() << std::endl;
 }
 
 void ExodusWriter::writeMesh(

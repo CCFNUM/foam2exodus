@@ -61,6 +61,7 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 add_executable(foam2exodus
     main.cpp
     src/OpenFOAMMeshReader.cpp
+    src/OpenFOAMFieldReader.cpp
     src/ExodusWriter.cpp
     src/MergedMeshReader.cpp
 )
@@ -91,6 +92,7 @@ if(Qt5_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/main_gui.cpp")
         src/main_gui.cpp
         src/MainWindow.cpp
         src/OpenFOAMMeshReader.cpp
+        src/OpenFOAMFieldReader.cpp
         src/ExodusWriter.cpp
         src/MergedMeshReader.cpp)
 
