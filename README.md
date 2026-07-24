@@ -160,7 +160,31 @@ Boundary patches from OpenFOAM are automatically exported as sidesets in the Exo
 - Arbitrary polyhedra (e.g. cfMesh hex cells with hanging nodes): split into
   conformal tetrahedra/pyramids via a per-cell centroid and shared per-face
   centroids, so the result is watertight and every element has positive volume.
-  Any standard cell whose ordering would be inverted is decomposed the same way.
+  A standard cell is decomposed the same way only if it fails validation.
+
+### Cell Recognition and Validation
+
+A cell is written as a standard Exodus element when it matches that element's
+topology, which is tested the same way OpenFOAM's own `hexMatcher` and friends
+do it: face count, face sizes, vertex count and how many faces each vertex is
+shared by. Face counts alone are not enough.
+
+The canonical node ordering comes from OpenFOAM's owner/neighbour convention
+(a face normal points out of its owner cell), never from the cell geometry, so
+slivers and strongly warped cells are ordered as reliably as regular ones. That
+convention yields exactly the ordering OpenFOAM's `cellShape` models use, which
+is also the Exodus node ordering.
+
+Before anything is written, every element is checked for supported topology,
+node count, repeated node IDs, coincident vertices, collapsed edges, corner
+Jacobian signs and signed volume. HEX8 volumes use the trilinear (2x2x2 Gauss)
+formula, the same one ParaView reports. A cell that fails is named in the
+message by its OpenFOAM cell ID; if no valid element can be produced at all the
+conversion fails rather than writing an inverted or collapsed element.
+
+Each element carries the Exodus attribute `source_openfoam_cell_id`. Elements
+produced by decomposing a cell also carry `source_openfoam_face_id` and
+`source_sub_element_index`, so any element maps back to its source cell.
 
 ### Mesh Components
 - Points (vertices)
@@ -183,9 +207,24 @@ foam2exodus/
 │   │   ├── OpenFOAMMeshReader.cpp  # OpenFOAM mesh parser implementation
 │   │   ├── ExodusWriter.h          # Exodus II writer interface
 │   │   └── ExodusWriter.cpp        # Exodus II database writer
-│   └── examples/           # Example test cases
+│   ├── examples/           # Example test cases
+│   └── tests/              # Regression tests and their polyMesh fixtures
 └── build/                  # Build directory (created by user)
 ```
+
+## Tests
+
+```bash
+python3 tests/run_tests.py            # uses build/foam2exodus
+python3 tests/run_tests.py --exe /path/to/foam2exodus
+```
+
+The fixtures in `tests/meshes/` cover an all-hexahedral mesh (a 280-cell cut-out
+of the WILO impeller mesh around its worst high-aspect-ratio cells), a genuinely
+polyhedral mesh (the dual of a block mesh), and the mixed hex/tet `3DCube`
+example. The tests check element counts and types, connectivity, orientation,
+volumes, scaled Jacobians, side-set coverage and source-cell traceability.
+Requires `numpy` and either `netCDF4` or `scipy`.
 
 ## Troubleshooting
 

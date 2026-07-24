@@ -53,24 +53,33 @@ private:
     // around a shared per-face centroid; the apex is a per-cell centroid.
     struct SubElem
     {
-        char type;               // 'T' tet, 'P' pyramid
-        std::vector<int> nodes;  // 0-based indices into base + extra points
+        char type;              // 'T' tet, 'P' pyramid
+        std::vector<int> nodes; // 0-based indices into base + extra points
+        int srcFace;            // OpenFOAM face the sub-element was built on
+        int srcSub;             // index of the sub-element within that face
     };
-    std::vector<Point> polyExtraPoints;  // appended after the reader points
+
+    std::vector<Point> polyExtraPoints; // appended after the reader points
     std::vector<SubElem> polySubElems;
     // Originating cell index of each sub-element, so decomposed elements can be
     // grouped into per-region (zone/mesh) blocks rather than one global block.
     std::vector<int> polySubElemCell;
     // Per cell: 1 if the cell is split into sub-elements instead of being
-    // written as a standard element. True for "unknown" cells and for any
-    // standard cell whose ordering would produce a non-positive volume.
+    // written as a standard element. True for cells that do not match a
+    // standard Exodus topology, and for any standard cell that fails the
+    // geometric validation below.
     std::vector<char> cellDecomposed;
+
+    // Canonical Exodus connectivity of every cell written as a standard
+    // element, computed once so element blocks and side sets cannot disagree.
+    // Empty for decomposed cells.
+    std::vector<std::vector<int>> cellOrderedNodes;
 
     // cellIdx -> block group name (zone name, "unzoned", or "fluid"), matching
     // how standard cells are grouped so poly blocks align with them.
-    std::vector<std::string> buildCellGroups(
-        const std::vector<Cell>& cells,
-        const std::vector<CellZone>& cellZones) const;
+    std::vector<std::string>
+    buildCellGroups(const std::vector<Cell>& cells,
+                    const std::vector<CellZone>& cellZones) const;
     // 1-based Exodus element ID of each sub-element, filled while writing
     // connectivity and consumed by writeSideSets.
     std::vector<int> polySubElemExoId;
@@ -84,6 +93,27 @@ private:
                                 const std::vector<Cell>& cells,
                                 const std::vector<int>& owner,
                                 int boundaryStart);
+
+    // Geometric verdict on one element, used both to decide whether a cell can
+    // be written as a standard element and to validate everything that is
+    // about to be written.
+    struct ElemCheck
+    {
+        bool valid = false;
+        std::string reason;
+        double volume = 0.0;
+        double scaledJacobian = 0.0;
+        double minEdge = 0.0;
+    };
+
+    // type is "hex"/"tet"/"pyr"/"wedge"; nodes index base + extra points.
+    ElemCheck checkElement(const std::string& type,
+                           const std::vector<int>& nodes,
+                           const std::vector<Point>& points) const;
+    // Validates every element that will be written; throws listing the
+    // offending OpenFOAM cell IDs if any element is unusable.
+    void validateElements(const std::vector<Point>& points,
+                          const std::vector<Cell>& cells) const;
 
     void initializeExodusFile(int numNodes,
                               int numElems,
@@ -100,6 +130,13 @@ private:
     template <typename ReaderType>
     void writeSideSetsImpl(const ReaderType& reader);
 
+    // Per-element provenance written as static Exodus element attributes.
+    static const std::vector<std::string>& standardAttribNames();
+    static const std::vector<std::string>& decomposedAttribNames();
+    void writeBlockAttributes(int blockId,
+                              bool decomposed,
+                              const std::vector<double>& values);
+
     void writeElements(const OpenFOAMMeshReader& reader);
     void writeSideSets(const OpenFOAMMeshReader& reader);
     void writeElements(const MergedMeshReader& reader);
@@ -108,18 +145,33 @@ private:
     void checkError(int status, const std::string& message);
     std::string getBlockName(const std::string& originalName);
     std::string getSidesetName(const std::string& originalName);
-    std::vector<int> orderHexNodes(const Cell& cell,
-                                   const std::vector<Face>& faces,
-                                   const std::vector<Point>& points);
-    std::vector<int> orderTetNodes(const Cell& cell,
-                                   const std::vector<Face>& faces,
-                                   const std::vector<Point>& points);
-    std::vector<int> orderPyramidNodes(const Cell& cell,
-                                       const std::vector<Face>& faces,
-                                       const std::vector<Point>& points);
-    std::vector<int> orderWedgeNodes(const Cell& cell,
-                                     const std::vector<Face>& faces,
-                                     const std::vector<Point>& points);
+
+    // Topology matchers. Each returns the canonical Exodus connectivity of the
+    // cell, or an empty vector when the cell is not that standard shape. The
+    // matching is purely topological: the orientation comes from OpenFOAM's
+    // owner/neighbour convention, never from the cell geometry, so degenerate
+    // or highly warped cells are ordered just as reliably as regular ones.
+    static std::vector<int> orderHexNodes(int cellIdx,
+                                          const Cell& cell,
+                                          const std::vector<Face>& faces,
+                                          const std::vector<int>& owner);
+    static std::vector<int> orderTetNodes(int cellIdx,
+                                          const Cell& cell,
+                                          const std::vector<Face>& faces,
+                                          const std::vector<int>& owner);
+    static std::vector<int> orderPyramidNodes(int cellIdx,
+                                              const Cell& cell,
+                                              const std::vector<Face>& faces,
+                                              const std::vector<int>& owner);
+    static std::vector<int> orderWedgeNodes(int cellIdx,
+                                            const Cell& cell,
+                                            const std::vector<Face>& faces,
+                                            const std::vector<int>& owner);
+    // Dispatches on cell.type; empty if the cell does not match that topology.
+    static std::vector<int> orderStandardNodes(int cellIdx,
+                                               const Cell& cell,
+                                               const std::vector<Face>& faces,
+                                               const std::vector<int>& owner);
     int getHexFaceId(const std::vector<int>& faceNodes,
                      const std::vector<int>& hexNodes);
     int getTetFaceId(const std::vector<int>& faceNodes,

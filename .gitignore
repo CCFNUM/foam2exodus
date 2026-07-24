@@ -26,6 +26,10 @@ foam2exodus-portable.tar.gz
 *.tar.gz
 *.zip
 
+# Python caches
+__pycache__/
+*.pyc
+
 # IDE and editor files
 .vscode/
 .idea/

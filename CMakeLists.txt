@@ -4,6 +4,10 @@ project(OpenFOAMToExodus VERSION 1.0.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Warnings: the converter's element construction is easy to get subtly wrong,
+# so build it with warnings on.
+add_compile_options(-Wall -Wextra)
+
 # Portability settings
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)

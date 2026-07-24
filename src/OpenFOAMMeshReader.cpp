@@ -618,7 +618,7 @@ void OpenFOAMMeshReader::readFaces()
             if (pos != std::string::npos)
             {
                 std::string numStr = line.substr(0, pos);
-                int nPointsInFace = parseLeadingInt(numStr);
+                parseLeadingInt(numStr);
 
                 std::string pointsStr = line.substr(pos + 1);
                 pointsStr.erase(
@@ -676,19 +676,19 @@ void OpenFOAMMeshReader::readOwner()
         std::vector<int> pending =
             parseIntListFromString(line.substr(consumedChars));
         size_t pendingIdx = 0;
-        while (pendingIdx < pending.size() && owner.size() < nFaces)
+        while (pendingIdx < pending.size() && (int)owner.size() < nFaces)
         {
             owner.push_back(pending[pendingIdx++]);
         }
 
-        while (owner.size() < nFaces)
+        while ((int)owner.size() < nFaces)
         {
             line = getNextNonEmptyLine(file);
             auto values = parseIntListFromString(line);
             for (int value : values)
             {
                 owner.push_back(value);
-                if (owner.size() == nFaces)
+                if ((int)owner.size() == nFaces)
                     break;
             }
         }
@@ -736,19 +736,20 @@ void OpenFOAMMeshReader::readNeighbour()
         std::vector<int> pending =
             parseIntListFromString(line.substr(consumedChars));
         size_t pendingIdx = 0;
-        while (pendingIdx < pending.size() && neighbour.size() < nInternalFaces)
+        while (pendingIdx < pending.size() &&
+               (int)neighbour.size() < nInternalFaces)
         {
             neighbour.push_back(pending[pendingIdx++]);
         }
 
-        while (neighbour.size() < nInternalFaces)
+        while ((int)neighbour.size() < nInternalFaces)
         {
             line = getNextNonEmptyLine(file);
             auto values = parseIntListFromString(line);
             for (int value : values)
             {
                 neighbour.push_back(value);
-                if (neighbour.size() == nInternalFaces)
+                if ((int)neighbour.size() == nInternalFaces)
                     break;
             }
         }
@@ -927,14 +928,15 @@ void OpenFOAMMeshReader::readCellZones()
                     std::string beforeParen = line.substr(0, parenPos);
                     std::istringstream iss(beforeParen);
                     std::string word;
-                    int nCells = 0;
                     while (iss >> word)
                     {
                         if (word != "cellLabels")
                         {
                             try
                             {
-                                nCells = parseLeadingInt(word);
+                                // Only validates the inline count token; the
+                                // labels themselves are parsed below.
+                                parseLeadingInt(word);
                             }
                             catch (...)
                             {
@@ -1003,7 +1005,14 @@ void OpenFOAMMeshReader::constructCells()
         throw std::runtime_error("Owner data not available");
     }
 
+    // A cell that never owns a face still appears as a neighbour, so both
+    // lists have to be consulted or the last cell can be dropped.
     int nCells = *std::max_element(owner.begin(), owner.end()) + 1;
+    if (!neighbour.empty())
+    {
+        nCells = std::max(
+            nCells, *std::max_element(neighbour.begin(), neighbour.end()) + 1);
+    }
     cells.resize(nCells);
 
     for (size_t faceIdx = 0; faceIdx < owner.size(); ++faceIdx)

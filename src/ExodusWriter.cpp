@@ -43,6 +43,9 @@ void ExodusWriter::initializeExodusFile(int numNodes,
                                         int numNodeSets,
                                         int numSideSets)
 {
+    // Node sets are not exported yet; the parameter keeps the signature
+    // aligned with the Exodus initialisation call.
+    (void)numNodeSets;
     int status =
         nc_create(filename.c_str(), NC_CLOBBER | NC_64BIT_OFFSET, &ncid);
     checkError(status, "Failed to create Exodus file");
@@ -196,404 +199,293 @@ void ExodusWriter::writeNodes(const std::vector<Point>& points)
     std::cout << "Wrote " << total << " nodes to Exodus file" << std::endl;
 }
 
-std::vector<int> ExodusWriter::orderTetNodes(const Cell& cell,
-                                             const std::vector<Face>& faces,
-                                             const std::vector<Point>& points)
+namespace
 {
-    if (cell.faceIndices.size() < 4)
-    {
-        return std::vector<int>(4, 0);
-    }
 
-    std::vector<std::vector<int>> triFaces;
-    for (int faceIdx : cell.faceIndices)
+// OpenFOAM stores every face with its right-hand-rule normal pointing out of
+// the face's owner cell. Exodus (like OpenFOAM's own cellShape models) wants
+// the base face of an element wound the other way round, with its normal
+// pointing into the element, so the loop is reversed for the owner and taken
+// as stored for the neighbour. This is exact topology: it never looks at the
+// geometry, so slivers and warped cells are oriented as reliably as cubes.
+std::vector<int> inwardLoop(const std::vector<int>& facePoints,
+                            int faceIdx,
+                            int cellIdx,
+                            const std::vector<int>& owner)
+{
+    std::vector<int> loop(facePoints);
+    if (faceIdx >= 0 && faceIdx < (int)owner.size() &&
+        owner[faceIdx] == cellIdx)
     {
-        if (faceIdx >= 0 && faceIdx < faces.size())
+        std::reverse(loop.begin(), loop.end());
+    }
+    return loop;
+}
+
+// Number of vertices of each face of a cell, plus how often each vertex is
+// used. Returns false if any face index is out of range.
+bool cellVertexUse(const Cell& cell,
+                   const std::vector<Face>& faces,
+                   std::map<int, int>& vertexUse,
+                   int& nTri,
+                   int& nQuad,
+                   int& nOther)
+{
+    vertexUse.clear();
+    nTri = nQuad = nOther = 0;
+    for (int fi : cell.faceIndices)
+    {
+        if (fi < 0 || fi >= (int)faces.size())
+            return false;
+        const auto& fv = faces[fi].pointIndices;
+        if (fv.size() == 3)
+            ++nTri;
+        else if (fv.size() == 4)
+            ++nQuad;
+        else
+            ++nOther;
+        for (int n : fv)
+            ++vertexUse[n];
+    }
+    return true;
+}
+
+// Given a base edge (n0,n1) of a cell, return the vertex adjacent to n0 on the
+// side face carrying that edge, i.e. the node directly "above" n0. -1 if no
+// side face carries the edge, which means the cell is not the assumed shape.
+int nodeAbove(int n0,
+              int n1,
+              int baseFace,
+              const Cell& cell,
+              const std::vector<Face>& faces,
+              const std::set<int>& baseSet)
+{
+    for (int fi : cell.faceIndices)
+    {
+        if (fi == baseFace)
+            continue;
+        const auto& sf = faces[fi].pointIndices;
+        const int nv = (int)sf.size();
+        int a = -1, b = -1;
+        for (int j = 0; j < nv; ++j)
         {
-            const auto& face = faces[faceIdx];
-            if (face.pointIndices.size() == 3)
-            {
-                triFaces.push_back(face.pointIndices);
-            }
+            if (sf[j] == n0)
+                a = j;
+            if (sf[j] == n1)
+                b = j;
         }
+        if (a < 0 || b < 0)
+            continue;
+        int cand = -1;
+        if ((a + 1) % nv == b)
+            cand = sf[(a + nv - 1) % nv];
+        else if ((a + nv - 1) % nv == b)
+            cand = sf[(a + 1) % nv];
+        if (cand >= 0 && baseSet.count(cand) == 0)
+            return cand;
     }
+    return -1;
+}
 
-    if (triFaces.size() < 4)
-    {
-        std::set<int> nodeSet;
-        for (const auto& face : triFaces)
+} // namespace
+
+std::vector<int> ExodusWriter::orderTetNodes(int cellIdx,
+                                             const Cell& cell,
+                                             const std::vector<Face>& faces,
+                                             const std::vector<int>& owner)
+{
+    // tetMatcher equivalent: four triangles, four vertices, each on 3 faces.
+    if (cell.faceIndices.size() != 4)
+        return {};
+    std::map<int, int> vertexUse;
+    int nTri = 0, nQuad = 0, nOther = 0;
+    if (!cellVertexUse(cell, faces, vertexUse, nTri, nQuad, nOther))
+        return {};
+    if (nTri != 4 || nQuad != 0 || nOther != 0 || vertexUse.size() != 4)
+        return {};
+    for (const auto& vu : vertexUse)
+        if (vu.second != 3)
+            return {};
+
+    const int baseFace = cell.faceIndices[0];
+    std::vector<int> nodes =
+        inwardLoop(faces[baseFace].pointIndices, baseFace, cellIdx, owner);
+    int apex = -1;
+    for (const auto& vu : vertexUse)
+        if (std::find(nodes.begin(), nodes.end(), vu.first) == nodes.end())
+            apex = vu.first;
+    if (apex < 0)
+        return {};
+    nodes.push_back(apex);
+    return nodes;
+}
+
+std::vector<int> ExodusWriter::orderPyramidNodes(int cellIdx,
+                                                 const Cell& cell,
+                                                 const std::vector<Face>& faces,
+                                                 const std::vector<int>& owner)
+{
+    // pyrMatcher equivalent: one quad base, four triangles, five vertices with
+    // the apex on four faces and each base vertex on three.
+    if (cell.faceIndices.size() != 5)
+        return {};
+    std::map<int, int> vertexUse;
+    int nTri = 0, nQuad = 0, nOther = 0;
+    if (!cellVertexUse(cell, faces, vertexUse, nTri, nQuad, nOther))
+        return {};
+    if (nTri != 4 || nQuad != 1 || nOther != 0 || vertexUse.size() != 5)
+        return {};
+
+    int quadFace = -1;
+    for (int fi : cell.faceIndices)
+        if (faces[fi].pointIndices.size() == 4)
+            quadFace = fi;
+
+    std::vector<int> nodes =
+        inwardLoop(faces[quadFace].pointIndices, quadFace, cellIdx, owner);
+    int apex = -1;
+    for (const auto& vu : vertexUse)
+        if (std::find(nodes.begin(), nodes.end(), vu.first) == nodes.end())
+            apex = vu.first;
+    if (apex < 0 || vertexUse[apex] != 4)
+        return {};
+    nodes.push_back(apex);
+    return nodes;
+}
+
+std::vector<int> ExodusWriter::orderWedgeNodes(int cellIdx,
+                                               const Cell& cell,
+                                               const std::vector<Face>& faces,
+                                               const std::vector<int>& owner)
+{
+    // prismMatcher equivalent: two triangles, three quads, six vertices each
+    // shared by three faces.
+    if (cell.faceIndices.size() != 5)
+        return {};
+    std::map<int, int> vertexUse;
+    int nTri = 0, nQuad = 0, nOther = 0;
+    if (!cellVertexUse(cell, faces, vertexUse, nTri, nQuad, nOther))
+        return {};
+    if (nTri != 2 || nQuad != 3 || nOther != 0 || vertexUse.size() != 6)
+        return {};
+    for (const auto& vu : vertexUse)
+        if (vu.second != 3)
+            return {};
+
+    int baseFace = -1;
+    for (int fi : cell.faceIndices)
+        if (faces[fi].pointIndices.size() == 3)
         {
-            for (int n : face)
-                nodeSet.insert(n);
+            baseFace = fi;
+            break;
         }
-        return std::vector<int>(nodeSet.begin(), nodeSet.end());
-    }
 
-    std::vector<int> face0 = triFaces[0];
-    std::set<int> nodes0(face0.begin(), face0.end());
+    std::vector<int> base =
+        inwardLoop(faces[baseFace].pointIndices, baseFace, cellIdx, owner);
+    std::set<int> baseSet(base.begin(), base.end());
 
-    int apexNode = -1;
-    for (const auto& face : triFaces)
+    std::vector<int> nodes(6, -1);
+    for (int i = 0; i < 3; ++i)
     {
-        for (int node : face)
-        {
-            if (nodes0.find(node) == nodes0.end())
+        nodes[i] = base[i];
+        int top = nodeAbove(
+            base[i], base[(i + 1) % 3], baseFace, cell, faces, baseSet);
+        if (top < 0)
+            return {};
+        nodes[3 + i] = top;
+    }
+    if (std::set<int>(nodes.begin(), nodes.end()).size() != 6)
+        return {};
+    return nodes;
+}
+
+std::vector<int> ExodusWriter::orderHexNodes(int cellIdx,
+                                             const Cell& cell,
+                                             const std::vector<Face>& faces,
+                                             const std::vector<int>& owner)
+{
+    // hexMatcher equivalent: six quadrilaterals, eight vertices, every vertex
+    // shared by exactly three faces. That set of conditions admits only the
+    // hexahedron, so no geometric test is needed to recognise one.
+    if (cell.faceIndices.size() != 6)
+        return {};
+    std::map<int, int> vertexUse;
+    int nTri = 0, nQuad = 0, nOther = 0;
+    if (!cellVertexUse(cell, faces, vertexUse, nTri, nQuad, nOther))
+        return {};
+    if (nQuad != 6 || nTri != 0 || nOther != 0 || vertexUse.size() != 8)
+        return {};
+    for (const auto& vu : vertexUse)
+        if (vu.second != 3)
+            return {};
+
+    // Any face can serve as the base; the opposite face must share no vertex
+    // with it, which is the remaining condition that rules out non-hexahedra.
+    const int baseFace = cell.faceIndices[0];
+    std::vector<int> base =
+        inwardLoop(faces[baseFace].pointIndices, baseFace, cellIdx, owner);
+    std::set<int> baseSet(base.begin(), base.end());
+
+    bool hasOpposite = false;
+    for (int fi : cell.faceIndices)
+    {
+        if (fi == baseFace)
+            continue;
+        bool shares = false;
+        for (int n : faces[fi].pointIndices)
+            if (baseSet.count(n))
             {
-                apexNode = node;
+                shares = true;
                 break;
             }
-        }
-        if (apexNode != -1)
+        if (!shares)
+        {
+            hasOpposite = true;
             break;
+        }
     }
+    if (!hasOpposite)
+        return {};
 
-    if (apexNode == -1)
+    std::vector<int> nodes(8, -1);
+    for (int i = 0; i < 4; ++i)
     {
-        apexNode = face0[0];
+        nodes[i] = base[i];
+        int top = nodeAbove(
+            base[i], base[(i + 1) % 4], baseFace, cell, faces, baseSet);
+        if (top < 0)
+            return {};
+        nodes[4 + i] = top;
     }
-
-    std::vector<int> orderedNodes(4);
-    orderedNodes[0] = face0[0];
-    orderedNodes[1] = face0[1];
-    orderedNodes[2] = face0[2];
-    orderedNodes[3] = apexNode;
-
-    // Ensure positive orientation: scalar triple product
-    // (p1-p0)·((p2-p0)×(p3-p0)) > 0
-    const Point& p0 = points[orderedNodes[0]];
-    const Point& p1 = points[orderedNodes[1]];
-    const Point& p2 = points[orderedNodes[2]];
-    const Point& p3 = points[orderedNodes[3]];
-    double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
-    double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
-    double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
-    double vol = v1x * (v2y * v3z - v2z * v3y) + v1y * (v2z * v3x - v2x * v3z) +
-                 v1z * (v2x * v3y - v2y * v3x);
-    if (vol < 0)
-    {
-        std::swap(orderedNodes[1], orderedNodes[2]);
-    }
-
-    return orderedNodes;
+    if (std::set<int>(nodes.begin(), nodes.end()).size() != 8)
+        return {};
+    return nodes;
 }
 
 std::vector<int>
-ExodusWriter::orderPyramidNodes(const Cell& cell,
-                                const std::vector<Face>& faces,
-                                const std::vector<Point>& points)
+ExodusWriter::orderStandardNodes(int cellIdx,
+                                 const Cell& cell,
+                                 const std::vector<Face>& faces,
+                                 const std::vector<int>& owner)
 {
-    if (cell.faceIndices.size() < 5)
-    {
-        return std::vector<int>(5, 0);
-    }
-
-    std::vector<int> quadFace;
-    std::vector<std::vector<int>> triFaces;
-
-    for (int faceIdx : cell.faceIndices)
-    {
-        if (faceIdx >= 0 && faceIdx < faces.size())
-        {
-            const auto& face = faces[faceIdx];
-            if (face.pointIndices.size() == 4)
-            {
-                quadFace = face.pointIndices;
-            }
-            else if (face.pointIndices.size() == 3)
-            {
-                triFaces.push_back(face.pointIndices);
-            }
-        }
-    }
-
-    if (quadFace.empty() || triFaces.empty())
-    {
-        std::set<int> nodeSet;
-        for (int faceIdx : cell.faceIndices)
-        {
-            if (faceIdx >= 0 && faceIdx < faces.size())
-            {
-                for (int n : faces[faceIdx].pointIndices)
-                {
-                    nodeSet.insert(n);
-                }
-            }
-        }
-        return std::vector<int>(nodeSet.begin(), nodeSet.end());
-    }
-
-    std::set<int> baseSet(quadFace.begin(), quadFace.end());
-    int apexNode = -1;
-    for (const auto& triFace : triFaces)
-    {
-        for (int node : triFace)
-        {
-            if (baseSet.find(node) == baseSet.end())
-            {
-                apexNode = node;
-                break;
-            }
-        }
-        if (apexNode != -1)
-            break;
-    }
-
-    if (apexNode == -1)
-    {
-        apexNode = quadFace[0];
-    }
-
-    std::vector<int> orderedNodes(5);
-    orderedNodes[0] = quadFace[0];
-    orderedNodes[1] = quadFace[1];
-    orderedNodes[2] = quadFace[2];
-    orderedNodes[3] = quadFace[3];
-    orderedNodes[4] = apexNode;
-
-    // Ensure positive orientation: the cross product of two base-quad edges
-    // crossed with the vector to apex should be positive (apex is on the
-    // positive-normal side of the base).
-    const Point& p0 = points[orderedNodes[0]];
-    const Point& p1 = points[orderedNodes[1]];
-    const Point& p3 = points[orderedNodes[3]];
-    const Point& p4 = points[orderedNodes[4]];
-    // Base-quad normal: (p1-p0) x (p3-p0)
-    double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
-    double v2x = p3.x - p0.x, v2y = p3.y - p0.y, v2z = p3.z - p0.z;
-    double nx = v1y * v2z - v1z * v2y;
-    double ny = v1z * v2x - v1x * v2z;
-    double nz = v1x * v2y - v1y * v2x;
-    // Vector from p0 to apex
-    double ax = p4.x - p0.x, ay = p4.y - p0.y, az = p4.z - p0.z;
-    // dot(normal, apex_vec) should be positive
-    if (nx * ax + ny * ay + nz * az < 0)
-    {
-        std::swap(orderedNodes[1], orderedNodes[3]);
-    }
-
-    return orderedNodes;
-}
-
-std::vector<int> ExodusWriter::orderHexNodes(const Cell& cell,
-                                             const std::vector<Face>& faces,
-                                             const std::vector<Point>& points)
-{
-    if (cell.faceIndices.size() < 6)
-    {
-        return std::vector<int>(8, 0);
-    }
-
-    std::vector<std::vector<int>> quadFaces;
-    for (int faceIdx : cell.faceIndices)
-    {
-        if (faceIdx >= 0 && faceIdx < faces.size())
-        {
-            const auto& face = faces[faceIdx];
-            if (face.pointIndices.size() == 4)
-            {
-                quadFaces.push_back(face.pointIndices);
-            }
-        }
-    }
-
-    if (quadFaces.size() != 6)
-    {
-        std::set<int> nodeSet;
-        for (const auto& face : quadFaces)
-        {
-            for (int n : face)
-                nodeSet.insert(n);
-        }
-        return std::vector<int>(nodeSet.begin(), nodeSet.end());
-    }
-
-    // Pick bottom face as the one with minimum mean Z centroid so that
-    // all elements use the same geometric face as "bottom" regardless of
-    // the arbitrary face-index order in the OpenFOAM cell's face list.
-    int bottomIdx = 0;
-    double minZ = 1e30;
-    for (int i = 0; i < (int)quadFaces.size(); ++i)
-    {
-        double z = 0.0;
-        for (int n : quadFaces[i])
-            z += points[n].z;
-        z /= 4.0;
-        if (z < minZ)
-        {
-            minZ = z;
-            bottomIdx = i;
-        }
-    }
-    std::vector<int> bottomFace = quadFaces[bottomIdx];
-    std::set<int> bottomSet(bottomFace.begin(), bottomFace.end());
-
-    std::vector<int> topFace;
-    int topFaceIdx = -1;
-    for (size_t i = 0; i < quadFaces.size(); ++i)
-    {
-        if ((int)i == bottomIdx)
-            continue;
-        std::set<int> faceSet(quadFaces[i].begin(), quadFaces[i].end());
-        std::vector<int> intersection;
-        std::set_intersection(bottomSet.begin(),
-                              bottomSet.end(),
-                              faceSet.begin(),
-                              faceSet.end(),
-                              std::back_inserter(intersection));
-
-        if (intersection.empty())
-        {
-            topFace = quadFaces[i];
-            topFaceIdx = i;
-            break;
-        }
-    }
-
-    if (topFace.empty())
-    {
-        std::set<int> nodeSet;
-        for (const auto& face : quadFaces)
-        {
-            for (int n : face)
-                nodeSet.insert(n);
-        }
-        return std::vector<int>(nodeSet.begin(), nodeSet.end());
-    }
-
-    std::vector<std::vector<int>> sideFaces;
-    for (size_t i = 0; i < quadFaces.size(); ++i)
-    {
-        if ((int)i != bottomIdx && (int)i != topFaceIdx)
-        {
-            sideFaces.push_back(quadFaces[i]);
-        }
-    }
-
-    std::vector<int> orderedNodes(8);
-    for (int i = 0; i < 4; i++)
-    {
-        orderedNodes[i] = bottomFace[i];
-    }
-
-    for (int i = 0; i < 4; i++)
-    {
-        int n0 = bottomFace[i];
-        int n1 = bottomFace[(i + 1) % 4];
-
-        int topNode = -1;
-        for (const auto& sideFace : sideFaces)
-        {
-            int n0Idx = -1, n1Idx = -1;
-
-            for (size_t j = 0; j < sideFace.size(); ++j)
-            {
-                if (sideFace[j] == n0)
-                    n0Idx = j;
-                if (sideFace[j] == n1)
-                    n1Idx = j;
-            }
-
-            if (n0Idx >= 0 && n1Idx >= 0)
-            {
-                int nextIdx = (n0Idx + 1) % 4;
-                int prevIdx = (n0Idx + 3) % 4;
-
-                int candidate = -1;
-                if (nextIdx == n1Idx)
-                {
-                    candidate = sideFace[prevIdx];
-                }
-                else if (prevIdx == n1Idx)
-                {
-                    candidate = sideFace[nextIdx];
-                }
-
-                if (candidate != -1)
-                {
-                    auto it =
-                        std::find(topFace.begin(), topFace.end(), candidate);
-                    if (it != topFace.end())
-                    {
-                        topNode = candidate;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (topNode == -1)
-        {
-            double minDist = 1e10;
-            for (int node : topFace)
-            {
-                bool alreadyUsed = false;
-                for (int j = 0; j < i; j++)
-                {
-                    if (orderedNodes[4 + j] == node)
-                    {
-                        alreadyUsed = true;
-                        break;
-                    }
-                }
-                if (!alreadyUsed)
-                {
-                    const Point& pb = points[n0];
-                    const Point& pt = points[node];
-                    double dx = pt.x - pb.x;
-                    double dy = pt.y - pb.y;
-                    double dz = pt.z - pb.z;
-                    double dist = dx * dx + dy * dy + dz * dz;
-
-                    if (dist < minDist)
-                    {
-                        minDist = dist;
-                        topNode = node;
-                    }
-                }
-            }
-        }
-
-        if (topNode != -1)
-        {
-            orderedNodes[4 + i] = topNode;
-        }
-        else
-        {
-            orderedNodes[4 + i] = topFace[i];
-        }
-    }
-
-    auto computeVolume = [&](const std::vector<int>& nodes) -> double
-    {
-        const Point& p0 = points[nodes[0]];
-        const Point& p1 = points[nodes[1]];
-        const Point& p3 = points[nodes[3]];
-        const Point& p4 = points[nodes[4]];
-
-        double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
-        double v2x = p3.x - p0.x, v2y = p3.y - p0.y, v2z = p3.z - p0.z;
-        double v3x = p4.x - p0.x, v3y = p4.y - p0.y, v3z = p4.z - p0.z;
-
-        return v1x * (v2y * v3z - v2z * v3y) + v1y * (v2z * v3x - v2x * v3z) +
-               v1z * (v2x * v3y - v2y * v3x);
-    };
-
-    double volume = computeVolume(orderedNodes);
-    if (volume < 0)
-    {
-        std::swap(orderedNodes[1], orderedNodes[3]);
-        std::swap(orderedNodes[5], orderedNodes[7]);
-    }
-
-    return orderedNodes;
+    if (cell.type == "hex")
+        return orderHexNodes(cellIdx, cell, faces, owner);
+    if (cell.type == "tet")
+        return orderTetNodes(cellIdx, cell, faces, owner);
+    if (cell.type == "pyr")
+        return orderPyramidNodes(cellIdx, cell, faces, owner);
+    if (cell.type == "wedge")
+        return orderWedgeNodes(cellIdx, cell, faces, owner);
+    return {};
 }
 
 std::vector<std::string>
 ExodusWriter::buildCellGroups(const std::vector<Cell>& cells,
-                             const std::vector<CellZone>& cellZones) const
+                              const std::vector<CellZone>& cellZones) const
 {
     // Mirror the standard-block grouping in writeElements: with >1 zone, cells
-    // are grouped by zone name (or "unzoned"); otherwise a single "fluid" group.
+    // are grouped by zone name (or "unzoned"); otherwise a single "fluid"
+    // group.
     std::vector<std::string> grp(cells.size(), "fluid");
     if (cellZones.size() > 1)
     {
@@ -604,6 +496,351 @@ ExodusWriter::buildCellGroups(const std::vector<Cell>& cells,
                     grp[ci] = z.name;
     }
     return grp;
+}
+
+namespace
+{
+
+// Local topology tables in Exodus node order, shared by the element checker.
+// Corner triads are the edge triples whose determinant is the Jacobian at that
+// vertex (the Verdict/VTK definition, so signs match ParaView's Mesh Quality).
+struct ElemTopo
+{
+    int nNodes;
+    std::vector<std::array<int, 2>> edges;
+    std::vector<std::array<int, 3>> corners;
+    // Outward faces; a -1 in the fourth slot marks a triangle.
+    std::vector<std::array<int, 4>> faces;
+};
+
+const ElemTopo& elemTopo(const std::string& type)
+{
+    static const ElemTopo hex{8,
+                              {{0, 1},
+                               {1, 2},
+                               {2, 3},
+                               {3, 0},
+                               {4, 5},
+                               {5, 6},
+                               {6, 7},
+                               {7, 4},
+                               {0, 4},
+                               {1, 5},
+                               {2, 6},
+                               {3, 7}},
+                              {{1, 3, 4},
+                               {2, 0, 5},
+                               {3, 1, 6},
+                               {0, 2, 7},
+                               {7, 5, 0},
+                               {4, 6, 1},
+                               {5, 7, 2},
+                               {6, 4, 3}},
+                              {{0, 1, 5, 4},
+                               {1, 2, 6, 5},
+                               {2, 3, 7, 6},
+                               {3, 0, 4, 7},
+                               {0, 3, 2, 1},
+                               {4, 5, 6, 7}}};
+    static const ElemTopo tet{
+        4,
+        {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}},
+        {{1, 2, 3}, {2, 0, 3}, {0, 1, 3}, {2, 1, 0}},
+        {{0, 1, 3, -1}, {1, 2, 3, -1}, {2, 0, 3, -1}, {0, 2, 1, -1}}};
+    static const ElemTopo pyr{
+        5,
+        {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {0, 4}, {1, 4}, {2, 4}, {3, 4}},
+        {{1, 3, 4}, {2, 0, 4}, {3, 1, 4}, {0, 2, 4}},
+        {{0, 1, 4, -1},
+         {1, 2, 4, -1},
+         {2, 3, 4, -1},
+         {3, 0, 4, -1},
+         {0, 3, 2, 1}}};
+    static const ElemTopo wedge{
+        6,
+        {{0, 1},
+         {1, 2},
+         {2, 0},
+         {3, 4},
+         {4, 5},
+         {5, 3},
+         {0, 3},
+         {1, 4},
+         {2, 5}},
+        {{1, 2, 3}, {2, 0, 4}, {0, 1, 5}, {5, 4, 0}, {3, 5, 1}, {4, 3, 2}},
+        {{0, 1, 4, 3},
+         {1, 2, 5, 4},
+         {2, 0, 3, 5},
+         {0, 2, 1, -1},
+         {3, 4, 5, -1}}};
+    static const ElemTopo none{0, {}, {}, {}};
+    if (type == "hex")
+        return hex;
+    if (type == "tet")
+        return tet;
+    if (type == "pyr")
+        return pyr;
+    if (type == "wedge")
+        return wedge;
+    return none;
+}
+
+double det3(const double a[3], const double b[3], const double c[3])
+{
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) +
+           a[1] * (b[2] * c[0] - b[0] * c[2]) +
+           a[2] * (b[0] * c[1] - b[1] * c[0]);
+}
+
+// Trilinear volume of a HEX8 by 2x2x2 Gauss quadrature. The Jacobian
+// determinant of a trilinear map is quadratic in each coordinate, so two
+// points per direction integrate it exactly; this reproduces the volume
+// ParaView reports. A volume built by fanning each quad face from one of its
+// corners does not, and for warped high-aspect cells it can even change sign.
+double hexTrilinearVolume(const std::vector<const Point*>& p)
+{
+    static const int sgn[8][3] = {{-1, -1, -1},
+                                  {1, -1, -1},
+                                  {1, 1, -1},
+                                  {-1, 1, -1},
+                                  {-1, -1, 1},
+                                  {1, -1, 1},
+                                  {1, 1, 1},
+                                  {-1, 1, 1}};
+    const double g = 1.0 / std::sqrt(3.0);
+    double vol = 0.0;
+    for (int q = 0; q < 8; ++q)
+    {
+        const double xi = sgn[q][0] * g, eta = sgn[q][1] * g,
+                     ze = sgn[q][2] * g;
+        double J[3][3] = {{0}};
+        for (int i = 0; i < 8; ++i)
+        {
+            const double a = sgn[i][0], b = sgn[i][1], c = sgn[i][2];
+            const double d[3] = {a * (1 + b * eta) * (1 + c * ze) / 8.0,
+                                 b * (1 + a * xi) * (1 + c * ze) / 8.0,
+                                 c * (1 + a * xi) * (1 + b * eta) / 8.0};
+            const double x[3] = {p[i]->x, p[i]->y, p[i]->z};
+            for (int r = 0; r < 3; ++r)
+                for (int s = 0; s < 3; ++s)
+                    J[r][s] += d[r] * x[s];
+        }
+        vol += det3(J[0], J[1], J[2]);
+    }
+    return vol;
+}
+
+// Volume from the outward faces via the divergence theorem, with quads split
+// about their centroid so a warped face contributes symmetrically. Used for
+// tets, pyramids and wedges, and matches how OpenFOAM computes cell volumes.
+double faceFanVolume(const std::vector<const Point*>& p, const ElemTopo& topo)
+{
+    auto triDiv = [](const Point& A, const Point& B, const Point& C)
+    {
+        const double a[3] = {A.x, A.y, A.z};
+        const double b[3] = {B.x, B.y, B.z};
+        const double c[3] = {C.x, C.y, C.z};
+        return det3(a, b, c);
+    };
+    double vol = 0.0;
+    for (const auto& f : topo.faces)
+    {
+        if (f[3] < 0)
+        {
+            vol += triDiv(*p[f[0]], *p[f[1]], *p[f[2]]);
+            continue;
+        }
+        Point ctr{0, 0, 0};
+        for (int k = 0; k < 4; ++k)
+        {
+            ctr.x += p[f[k]]->x / 4.0;
+            ctr.y += p[f[k]]->y / 4.0;
+            ctr.z += p[f[k]]->z / 4.0;
+        }
+        for (int k = 0; k < 4; ++k)
+            vol += triDiv(*p[f[k]], *p[f[(k + 1) % 4]], ctr);
+    }
+    return vol / 6.0;
+}
+
+} // namespace
+
+ExodusWriter::ElemCheck
+ExodusWriter::checkElement(const std::string& type,
+                           const std::vector<int>& nodes,
+                           const std::vector<Point>& points) const
+{
+    ElemCheck res;
+    const ElemTopo& topo = elemTopo(type);
+    if (topo.nNodes == 0)
+    {
+        res.reason = "unsupported topology '" + type + "'";
+        return res;
+    }
+    if ((int)nodes.size() != topo.nNodes)
+    {
+        res.reason = "expected " + std::to_string(topo.nNodes) +
+                     " nodes, got " + std::to_string(nodes.size());
+        return res;
+    }
+
+    const int nBase = (int)points.size();
+    std::vector<const Point*> p(topo.nNodes);
+    for (int i = 0; i < topo.nNodes; ++i)
+    {
+        const int n = nodes[i];
+        if (n < 0 || n >= nBase + (int)polyExtraPoints.size())
+        {
+            res.reason = "node index " + std::to_string(n) + " out of range";
+            return res;
+        }
+        p[i] = (n < nBase) ? &points[n] : &polyExtraPoints[n - nBase];
+    }
+
+    if (std::set<int>(nodes.begin(), nodes.end()).size() != (size_t)topo.nNodes)
+    {
+        res.reason = "repeated node ID in connectivity";
+        return res;
+    }
+
+    // Longest edge sets the length scale for the degeneracy tolerances.
+    double maxEdge = 0.0;
+    res.minEdge = 1e300;
+    for (const auto& e : topo.edges)
+    {
+        const double dx = p[e[1]]->x - p[e[0]]->x;
+        const double dy = p[e[1]]->y - p[e[0]]->y;
+        const double dz = p[e[1]]->z - p[e[0]]->z;
+        const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        res.minEdge = std::min(res.minEdge, len);
+        maxEdge = std::max(maxEdge, len);
+    }
+    if (maxEdge <= 0.0)
+    {
+        res.reason = "all vertices coincide";
+        return res;
+    }
+    for (int i = 0; i < topo.nNodes; ++i)
+        for (int j = i + 1; j < topo.nNodes; ++j)
+        {
+            const double dx = p[j]->x - p[i]->x;
+            const double dy = p[j]->y - p[i]->y;
+            const double dz = p[j]->z - p[i]->z;
+            if (std::sqrt(dx * dx + dy * dy + dz * dz) <= 1e-12 * maxEdge)
+            {
+                res.reason = "coincident local vertices " + std::to_string(i) +
+                             " and " + std::to_string(j);
+                return res;
+            }
+        }
+    if (res.minEdge <= 1e-12 * maxEdge)
+    {
+        res.reason = "collapsed edge";
+        return res;
+    }
+
+    // Jacobian at every corner; the minimum normalised value is the scaled
+    // Jacobian, negative for an inverted or wrongly ordered element.
+    res.scaledJacobian = 1e300;
+    for (size_t ci = 0; ci < topo.corners.size(); ++ci)
+    {
+        // Triad entry k is the far end of the k-th edge leaving corner ci.
+        const auto& c = topo.corners[ci];
+        double v[3][3];
+        double len[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            const Point& q = *p[c[k]];
+            v[k][0] = q.x - p[ci]->x;
+            v[k][1] = q.y - p[ci]->y;
+            v[k][2] = q.z - p[ci]->z;
+            len[k] = std::sqrt(v[k][0] * v[k][0] + v[k][1] * v[k][1] +
+                               v[k][2] * v[k][2]);
+        }
+        if (len[0] <= 0.0 || len[1] <= 0.0 || len[2] <= 0.0)
+        {
+            res.reason = "degenerate corner";
+            return res;
+        }
+        double sj = det3(v[0], v[1], v[2]) / (len[0] * len[1] * len[2]);
+        if (type == "tet")
+            sj *= std::sqrt(2.0);
+        res.scaledJacobian = std::min(res.scaledJacobian, sj);
+    }
+
+    res.volume =
+        (type == "hex") ? hexTrilinearVolume(p) : faceFanVolume(p, topo);
+
+    if (res.scaledJacobian <= 0.0)
+    {
+        res.reason = "non-positive Jacobian (scaled Jacobian " +
+                     std::to_string(res.scaledJacobian) + ")";
+        return res;
+    }
+    if (res.volume <= 0.0)
+    {
+        res.reason = "non-positive volume (" + std::to_string(res.volume) + ")";
+        return res;
+    }
+
+    res.valid = true;
+    return res;
+}
+
+void ExodusWriter::validateElements(const std::vector<Point>& points,
+                                    const std::vector<Cell>& cells) const
+{
+    std::vector<std::string> errors;
+    double minSJ = 1e300, maxSJ = -1e300, minVol = 1e300;
+    int nChecked = 0;
+
+    auto record = [&](const ElemCheck& chk, const std::string& what)
+    {
+        if (!chk.valid)
+        {
+            if (errors.size() < 20)
+                errors.push_back(what + ": " + chk.reason);
+            return;
+        }
+        minSJ = std::min(minSJ, chk.scaledJacobian);
+        maxSJ = std::max(maxSJ, chk.scaledJacobian);
+        minVol = std::min(minVol, chk.volume);
+        ++nChecked;
+    };
+
+    for (size_t c = 0; c < cells.size(); ++c)
+    {
+        if (cellDecomposed[c] || cellOrderedNodes[c].empty())
+            continue;
+        record(checkElement(cells[c].type, cellOrderedNodes[c], points),
+               "OpenFOAM cell " + std::to_string(c) + " (" + cells[c].type +
+                   ")");
+    }
+
+    for (size_t g = 0; g < polySubElems.size(); ++g)
+    {
+        const std::string type = (polySubElems[g].type == 'T') ? "tet" : "pyr";
+        record(checkElement(type, polySubElems[g].nodes, points),
+               "sub-element " + std::to_string(polySubElems[g].srcSub) +
+                   " of OpenFOAM face " +
+                   std::to_string(polySubElems[g].srcFace) +
+                   " of OpenFOAM cell " + std::to_string(polySubElemCell[g]) +
+                   " (" + type + ")");
+    }
+
+    if (!errors.empty())
+    {
+        std::string msg = "mesh validation failed for " +
+                          std::to_string(errors.size()) +
+                          "+ element(s); no Exodus file written:";
+        for (const auto& e : errors)
+            msg += "\n  " + e;
+        throw std::runtime_error(msg);
+    }
+
+    std::cout << "Validated " << nChecked << " elements: scaled Jacobian in ["
+              << minSJ << ", " << maxSJ << "], min volume " << minVol
+              << std::endl;
 }
 
 void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
@@ -624,82 +861,48 @@ void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
     // Coordinate of a node index in the combined [base ; extra] space. Returns
     // by value so it stays valid across push_backs into polyExtraPoints.
     auto pointAt = [&](int idx) -> Point
-    {
-        return (idx < nBase) ? points[idx] : polyExtraPoints[idx - nBase];
-    };
-
-    // Signed volume (x6) of tet (a,b,c,d); >0 for positive Exodus orientation.
-    auto tetVol = [&](int a, int b, int c, int d) -> double
-    {
-        Point p0 = pointAt(a), p1 = pointAt(b), p2 = pointAt(c), p3 = pointAt(d);
-        double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
-        double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
-        double v3x = p3.x - p0.x, v3y = p3.y - p0.y, v3z = p3.z - p0.z;
-        return v1x * (v2y * v3z - v2z * v3y) + v1y * (v2z * v3x - v2x * v3z) +
-               v1z * (v2x * v3y - v2y * v3x);
-    };
-
-    // Divergence-theorem contribution of an outward triangle, used to get the
-    // signed volume of a standard element from its Exodus (outward) faces.
-    auto triDiv = [&](int a, int b, int c) -> double
-    {
-        Point A = pointAt(a), B = pointAt(b), C = pointAt(c);
-        return A.x * (B.y * C.z - B.z * C.y) + A.y * (B.z * C.x - B.x * C.z) +
-               A.z * (B.x * C.y - B.y * C.x);
-    };
-    // Signed volume of a standard element given its ordered nodes; <=0 means
-    // the ordering is invalid/inverted and the cell should be decomposed.
-    auto stdVol = [&](const std::vector<int>& n, const std::string& t) -> double
-    {
-        double v = 0.0;
-        auto Q = [&](int a, int b, int c, int d)
-        { v += triDiv(n[a], n[b], n[c]) + triDiv(n[a], n[c], n[d]); };
-        auto T = [&](int a, int b, int c) { v += triDiv(n[a], n[b], n[c]); };
-        if (t == "hex")
-        {
-            Q(0, 1, 5, 4); Q(1, 2, 6, 5); Q(2, 3, 7, 6);
-            Q(3, 0, 4, 7); Q(0, 3, 2, 1); Q(4, 5, 6, 7);
-        }
-        else if (t == "tet")
-        {
-            T(0, 1, 3); T(1, 2, 3); T(2, 0, 3); T(0, 2, 1);
-        }
-        else if (t == "pyr")
-        {
-            T(0, 1, 4); T(1, 2, 4); T(2, 3, 4); T(3, 0, 4); Q(0, 3, 2, 1);
-        }
-        else if (t == "wedge")
-        {
-            Q(0, 1, 4, 3); Q(1, 2, 5, 4); Q(2, 0, 3, 5); T(0, 2, 1); T(3, 4, 5);
-        }
-        return v / 6.0;
-    };
+    { return (idx < nBase) ? points[idx] : polyExtraPoints[idx - nBase]; };
 
     // Face centroids are shared per face so both adjacent poly cells fan an
     // n-gon identically, keeping the split conformal.
     std::unordered_map<int, int> faceCentroidNode;
 
+    cellOrderedNodes.assign(cells.size(), {});
+    int nRejected = 0;
+
     for (int c = 0; c < (int)cells.size(); ++c)
     {
         const auto& cell = cells[c];
 
-        // Decompose "unknown" cells, and also any standard cell whose ordering
-        // would yield a non-positive volume (mirrors what writeElements emits,
-        // so those otherwise-inverted elements are rescued as valid sub-cells).
+        // A cell is written as a standard Exodus element when it matches that
+        // topology and the resulting element is geometrically sound. Anything
+        // else - a genuine polyhedron, or a standard cell whose geometry is
+        // unusable - is reported and split into conformal tets/pyramids.
         if (cell.type != "unknown")
         {
-            std::vector<int> on;
-            int need = 8;
-            if (cell.type == "hex")
-                on = orderHexNodes(cell, faces, points);
-            else if (cell.type == "tet")
-                on = orderTetNodes(cell, faces, points), need = 4;
-            else if (cell.type == "pyr")
-                on = orderPyramidNodes(cell, faces, points), need = 5;
-            else if (cell.type == "wedge")
-                on = orderWedgeNodes(cell, faces, points), need = 6;
-            if ((int)on.size() == need && stdVol(on, cell.type) > 0.0)
-                continue;  // valid standard element; leave it as-is
+            std::vector<int> on = orderStandardNodes(c, cell, faces, owner);
+            if (!on.empty())
+            {
+                ElemCheck chk = checkElement(cell.type, on, points);
+                if (chk.valid)
+                {
+                    cellOrderedNodes[c] = std::move(on);
+                    continue;
+                }
+                std::cerr << "Warning: OpenFOAM cell " << c << " (" << cell.type
+                          << ") rejected as a standard element: " << chk.reason
+                          << "; decomposing it instead" << std::endl;
+                ++nRejected;
+            }
+            else if (cell.type == "hex" || cell.type == "tet" ||
+                     cell.type == "pyr" || cell.type == "wedge")
+            {
+                std::cerr << "Warning: OpenFOAM cell " << c
+                          << " has the face counts of a " << cell.type
+                          << " but does not match that topology; decomposing it"
+                          << std::endl;
+                ++nRejected;
+            }
         }
         cellDecomposed[c] = 1;
 
@@ -730,37 +933,39 @@ void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
         {
             if (fi < 0 || fi >= (int)faces.size())
                 continue;
-            const auto& fv = faces[fi].pointIndices;
-            int nv = (int)fv.size();
-            bool onBoundary = (fi >= boundaryStart) && (owner[fi] == c);
+            // Wind the face so its normal points into this cell, which is the
+            // side the centroid apex sits on. Doing it from the owner /
+            // neighbour relation rather than from a signed volume keeps the
+            // sub-elements correctly oriented even for warped faces.
+            const std::vector<int> fv =
+                inwardLoop(faces[fi].pointIndices, fi, c, owner);
+            const int nv = (int)fv.size();
+            const bool onBoundary = (fi >= boundaryStart) && (owner[fi] == c);
 
             if (nv == 3)
             {
-                int a = fv[0], b = fv[1], cc = fv[2];
-                if (tetVol(a, b, cc, cNode) < 0)
-                    std::swap(b, cc);
                 int gid = (int)polySubElems.size();
-                polySubElems.push_back({'T', {a, b, cc, cNode}});
+                polySubElems.push_back(
+                    {'T', {fv[0], fv[1], fv[2], cNode}, fi, 0});
                 if (onBoundary)
                     polyFaceToSubs[fi].push_back(
                         {gid, getTetFaceId(fv, polySubElems[gid].nodes)});
             }
             else if (nv == 4)
             {
-                int q0 = fv[0], q1 = fv[1], q2 = fv[2], q3 = fv[3];
-                // Orient the base from the true split volume (same q0-q2
-                // diagonal the pyramid is later evaluated on), which is robust
-                // for warped quads unlike a single-triangle normal.
-                if (tetVol(q0, q1, q2, cNode) + tetVol(q0, q2, q3, cNode) < 0)
-                    std::swap(q1, q3);
                 int gid = (int)polySubElems.size();
-                polySubElems.push_back({'P', {q0, q1, q2, q3, cNode}});
+                polySubElems.push_back(
+                    {'P', {fv[0], fv[1], fv[2], fv[3], cNode}, fi, 0});
                 if (onBoundary)
                     polyFaceToSubs[fi].push_back(
                         {gid, getPyramidFaceId(fv, polySubElems[gid].nodes)});
             }
             else if (nv >= 5)
             {
+                // An arbitrary polygon is fanned into nv triangles around a
+                // per-face centroid node shared with the cell on the other
+                // side of the face, so the split stays conformal. Each
+                // triangle plus the cell centroid forms one tetrahedron.
                 int fNode;
                 auto it = faceCentroidNode.find(fi);
                 if (it == faceCentroidNode.end())
@@ -783,12 +988,9 @@ void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
                 }
                 for (int k = 0; k < nv; ++k)
                 {
-                    int a = fv[k], b = fv[(k + 1) % nv];
-                    int y = b, z = fNode;
-                    if (tetVol(a, y, z, cNode) < 0)
-                        std::swap(y, z);
+                    const int a = fv[k], b = fv[(k + 1) % nv];
                     int gid = (int)polySubElems.size();
-                    polySubElems.push_back({'T', {a, y, z, cNode}});
+                    polySubElems.push_back({'T', {a, b, fNode, cNode}, fi, k});
                     if (onBoundary)
                     {
                         std::vector<int> tri = {a, b, fNode};
@@ -803,13 +1005,68 @@ void ExodusWriter::buildPolyDecomposition(const std::vector<Point>& points,
     }
 
     polySubElemExoId.assign(polySubElems.size(), 0);
+
+    if (nRejected > 0)
+    {
+        std::cerr << "Warning: " << nRejected
+                  << " cell(s) with standard face counts could not be written "
+                     "as standard elements and were decomposed"
+                  << std::endl;
+    }
+}
+
+// Names of the per-element attributes that trace an Exodus element back to the
+// OpenFOAM cell it came from. One-to-one elements carry the source cell ID
+// only; sub-elements of a decomposed cell also carry the face they were built
+// on and their index within that face.
+const std::vector<std::string>& ExodusWriter::standardAttribNames()
+{
+    static const std::vector<std::string> names{"source_openfoam_cell_id"};
+    return names;
+}
+
+const std::vector<std::string>& ExodusWriter::decomposedAttribNames()
+{
+    static const std::vector<std::string> names{"source_openfoam_cell_id",
+                                                "source_openfoam_face_id",
+                                                "source_sub_element_index"};
+    return names;
+}
+
+void ExodusWriter::writeBlockAttributes(int blockId,
+                                        bool decomposed,
+                                        const std::vector<double>& values)
+{
+    const std::string blk_num = std::to_string(blockId);
+    const std::vector<std::string>& names =
+        decomposed ? decomposedAttribNames() : standardAttribNames();
+
+    int var_id;
+    checkError(nc_inq_varid(ncid, ("attrib" + blk_num).c_str(), &var_id),
+               "Failed to get element attribute variable");
+    if (!values.empty())
+    {
+        checkError(nc_put_var_double(ncid, var_id, values.data()),
+                   "Failed to write element attributes");
+    }
+
+    checkError(nc_inq_varid(ncid, ("attrib_name" + blk_num).c_str(), &var_id),
+               "Failed to get element attribute name variable");
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        char buffer[33];
+        std::memset(buffer, 0, sizeof(buffer));
+        std::strncpy(buffer, names[i].c_str(), 32);
+        size_t start[2] = {i, 0};
+        size_t count[2] = {1, 33};
+        checkError(nc_put_vara_text(ncid, var_id, start, count, buffer),
+                   "Failed to write element attribute name");
+    }
 }
 
 void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 {
     const auto& cells = reader.getCells();
-    const auto& faces = reader.getFaces();
-    const auto& points = reader.getPoints();
     const auto& cellZones = reader.getCellZones();
 
     nc_redef(ncid);
@@ -839,7 +1096,7 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
 
             for (int cellIdx : zone.cellIndices)
             {
-                if (cellIdx < cells.size())
+                if (cellIdx < (int)cells.size())
                 {
                     if (!cellDecomposed[cellIdx])
                         zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
@@ -927,12 +1184,15 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         }
     }
 
+    int dim_len_name;
+    checkError(nc_inq_dimid(ncid, "len_name", &dim_len_name),
+               "Failed to get len_name dimension");
+
     int blockId = 1;
     for (const auto& block : blocks)
     {
-        int numElemsInBlock =
-            block.decomposed ? (int)block.subIndices.size()
-                             : (int)block.cellIndices.size();
+        int numElemsInBlock = block.decomposed ? (int)block.subIndices.size()
+                                               : (int)block.cellIndices.size();
 
         int numNodesPerElem = 8;
         std::string exoType = "HEX8";
@@ -988,6 +1248,37 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
             ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
         checkError(status, "Failed to set element type attribute");
 
+        // Per-element attributes carrying the source-cell provenance. They are
+        // static Exodus attributes rather than transient element variables, so
+        // a pure mesh file stays free of time steps.
+        const std::vector<std::string>& attNames =
+            block.decomposed ? decomposedAttribNames() : standardAttribNames();
+        int dim_num_att;
+        status = nc_def_dim(ncid,
+                            ("num_att_in_blk" + blk_num).c_str(),
+                            attNames.size(),
+                            &dim_num_att);
+        checkError(status, "Failed to define element attribute dimension");
+
+        int var_attrib, var_attrib_name;
+        int dims_attrib[2] = {dim_num_el_in_blk, dim_num_att};
+        status = nc_def_var(ncid,
+                            ("attrib" + blk_num).c_str(),
+                            NC_DOUBLE,
+                            2,
+                            dims_attrib,
+                            &var_attrib);
+        checkError(status, "Failed to define element attribute variable");
+
+        int dims_attrib_name[2] = {dim_num_att, dim_len_name};
+        status = nc_def_var(ncid,
+                            ("attrib_name" + blk_num).c_str(),
+                            NC_CHAR,
+                            2,
+                            dims_attrib_name,
+                            &var_attrib_name);
+        checkError(status, "Failed to define element attribute name variable");
+
         blockId++;
     }
 
@@ -1000,6 +1291,7 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
     for (const auto& block : blocks)
     {
         std::vector<int> connectivity;
+        std::vector<double> attribSource;
 
         if (block.decomposed)
         {
@@ -1008,32 +1300,20 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
                 polySubElemExoId[gid] = nextExodusElem++;
                 for (int n : polySubElems[gid].nodes)
                     connectivity.push_back(n + 1);
+                attribSource.push_back(polySubElemCell[gid]);
+                attribSource.push_back(polySubElems[gid].srcFace);
+                attribSource.push_back(polySubElems[gid].srcSub);
             }
         }
         else
             for (int cellIdx : block.cellIndices)
             {
                 cellToExodusElem[cellIdx] = nextExodusElem++;
+                attribSource.push_back(cellIdx);
 
-                const auto& cell = cells[cellIdx];
-
-                std::vector<int> nodes;
-                if (block.cellType == "hex")
-                {
-                    nodes = orderHexNodes(cell, faces, points);
-                }
-                else if (block.cellType == "tet")
-                {
-                    nodes = orderTetNodes(cell, faces, points);
-                }
-                else if (block.cellType == "pyr")
-                {
-                    nodes = orderPyramidNodes(cell, faces, points);
-                }
-                else if (block.cellType == "wedge")
-                {
-                    nodes = orderWedgeNodes(cell, faces, points);
-                }
+                // Connectivity was matched and validated up front, so it is
+                // reused verbatim here and in the side sets.
+                const std::vector<int>& nodes = cellOrderedNodes[cellIdx];
 
                 int numNodesPerElem = (block.cellType == "tet")     ? 4
                                       : (block.cellType == "pyr")   ? 5
@@ -1041,15 +1321,16 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
                                                                     : 8;
                 if ((int)nodes.size() != numNodesPerElem)
                 {
-                    std::cerr << "Warning: cell " << cellIdx
-                              << " (type=" << block.cellType << ") returned "
-                              << nodes.size() << " nodes, expected "
-                              << numNodesPerElem << std::endl;
+                    throw std::runtime_error(
+                        "internal error: OpenFOAM cell " +
+                        std::to_string(cellIdx) + " (type=" + block.cellType +
+                        ") has " + std::to_string(nodes.size()) +
+                        " ordered nodes, expected " +
+                        std::to_string(numNodesPerElem));
                 }
                 for (int i = 0; i < numNodesPerElem; ++i)
                 {
-                    connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
-                                                                 : 1);
+                    connectivity.push_back(nodes[i] + 1);
                 }
             }
 
@@ -1057,6 +1338,8 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
         nc_inq_varid(
             ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, connectivity.data());
+
+        writeBlockAttributes(blockId, block.decomposed, attribSource);
 
         int eb_status = 1;
         int var_status;
@@ -1083,169 +1366,10 @@ void ExodusWriter::writeElements(const OpenFOAMMeshReader& reader)
                   << ") with "
                   << (block.decomposed ? block.subIndices.size()
                                        : block.cellIndices.size())
-                  << " elements"
-                  << std::endl;
+                  << " elements" << std::endl;
 
         blockId++;
     }
-}
-
-std::vector<int> ExodusWriter::orderWedgeNodes(const Cell& cell,
-                                               const std::vector<Face>& faces,
-                                               const std::vector<Point>& points)
-{
-    if (cell.faceIndices.size() < 5)
-    {
-        return std::vector<int>(6, 0);
-    }
-
-    std::vector<int> triFaceIndices;
-    std::vector<int> quadFaceIndices;
-    for (int faceIdx : cell.faceIndices)
-    {
-        if (faceIdx >= 0 && faceIdx < (int)faces.size())
-        {
-            int nPts = faces[faceIdx].pointIndices.size();
-            if (nPts == 3)
-                triFaceIndices.push_back(faceIdx);
-            else if (nPts == 4)
-                quadFaceIndices.push_back(faceIdx);
-        }
-    }
-
-    if (triFaceIndices.size() != 2 || quadFaceIndices.size() != 3)
-    {
-        std::set<int> nodeSet;
-        for (int fi : cell.faceIndices)
-        {
-            if (fi >= 0 && fi < (int)faces.size())
-                for (int n : faces[fi].pointIndices)
-                    nodeSet.insert(n);
-        }
-        std::vector<int> nodes(nodeSet.begin(), nodeSet.end());
-        nodes.resize(6, 0);
-        return nodes;
-    }
-
-    // Pick the tri face with lower mean-Z as "bottom" for consistent
-    // orientation
-    auto triCentroidZ = [&](int fi)
-    {
-        double z = 0.0;
-        for (int n : faces[fi].pointIndices)
-            z += points[n].z;
-        return z / 3.0;
-    };
-    int bottomTriIdx =
-        (triCentroidZ(triFaceIndices[0]) <= triCentroidZ(triFaceIndices[1]))
-            ? triFaceIndices[0]
-            : triFaceIndices[1];
-    int topTriIdx = (bottomTriIdx == triFaceIndices[0]) ? triFaceIndices[1]
-                                                        : triFaceIndices[0];
-
-    const std::vector<int>& bottomFace = faces[bottomTriIdx].pointIndices;
-    const std::vector<int>& topFace = faces[topTriIdx].pointIndices;
-
-    std::vector<int> orderedNodes(6);
-    orderedNodes[0] = bottomFace[0];
-    orderedNodes[1] = bottomFace[1];
-    orderedNodes[2] = bottomFace[2];
-
-    // Map each bottom node to its corresponding top node via shared quad side
-    // faces
-    for (int i = 0; i < 3; ++i)
-    {
-        int n0 = bottomFace[i];
-        int n1 = bottomFace[(i + 1) % 3];
-
-        int topNode = -1;
-        for (int qfi : quadFaceIndices)
-        {
-            const auto& qf = faces[qfi].pointIndices;
-            int n0Idx = -1, n1Idx = -1;
-            for (int j = 0; j < 4; ++j)
-            {
-                if (qf[j] == n0)
-                    n0Idx = j;
-                if (qf[j] == n1)
-                    n1Idx = j;
-            }
-            if (n0Idx >= 0 && n1Idx >= 0)
-            {
-                int nextIdx = (n0Idx + 1) % 4;
-                int prevIdx = (n0Idx + 3) % 4;
-                int candidate = -1;
-                if (nextIdx == n1Idx)
-                    candidate = qf[prevIdx];
-                else if (prevIdx == n1Idx)
-                    candidate = qf[nextIdx];
-                if (candidate != -1)
-                {
-                    auto it =
-                        std::find(topFace.begin(), topFace.end(), candidate);
-                    if (it != topFace.end())
-                    {
-                        topNode = candidate;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (topNode == -1)
-        {
-            // Fallback: nearest unused top node to n0
-            double minDist = 1e30;
-            for (int node : topFace)
-            {
-                bool used = false;
-                for (int j = 0; j < i; ++j)
-                    if (orderedNodes[3 + j] == node)
-                    {
-                        used = true;
-                        break;
-                    }
-                if (!used)
-                {
-                    const Point& pb = points[n0];
-                    const Point& pt = points[node];
-                    double dist = (pt.x - pb.x) * (pt.x - pb.x) +
-                                  (pt.y - pb.y) * (pt.y - pb.y) +
-                                  (pt.z - pb.z) * (pt.z - pb.z);
-                    if (dist < minDist)
-                    {
-                        minDist = dist;
-                        topNode = node;
-                    }
-                }
-            }
-        }
-        orderedNodes[3 + i] = (topNode != -1) ? topNode : topFace[i];
-    }
-
-    // Orientation check: normal of bottom triangle should point toward top
-    // nodes. n = (p1-p0) x (p2-p0);  h = centroid(top) - centroid(bottom)
-    const Point& p0 = points[orderedNodes[0]];
-    const Point& p1 = points[orderedNodes[1]];
-    const Point& p2 = points[orderedNodes[2]];
-    const Point& p3 = points[orderedNodes[3]];
-    const Point& p4 = points[orderedNodes[4]];
-    const Point& p5 = points[orderedNodes[5]];
-    double v1x = p1.x - p0.x, v1y = p1.y - p0.y, v1z = p1.z - p0.z;
-    double v2x = p2.x - p0.x, v2y = p2.y - p0.y, v2z = p2.z - p0.z;
-    double nx = v1y * v2z - v1z * v2y;
-    double ny = v1z * v2x - v1x * v2z;
-    double nz = v1x * v2y - v1y * v2x;
-    double hx = (p3.x + p4.x + p5.x) / 3.0 - (p0.x + p1.x + p2.x) / 3.0;
-    double hy = (p3.y + p4.y + p5.y) / 3.0 - (p0.y + p1.y + p2.y) / 3.0;
-    double hz = (p3.z + p4.z + p5.z) / 3.0 - (p0.z + p1.z + p2.z) / 3.0;
-    if (nx * hx + ny * hy + nz * hz < 0)
-    {
-        std::swap(orderedNodes[1], orderedNodes[2]);
-        std::swap(orderedNodes[4], orderedNodes[5]);
-    }
-
-    return orderedNodes;
 }
 
 int ExodusWriter::getHexFaceId(const std::vector<int>& faceNodes,
@@ -1338,28 +1462,11 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
     const auto& faces = reader.getFaces();
     const auto& owner = reader.getOwner();
     const auto& cells = reader.getCells();
-    const auto& points = reader.getPoints();
 
     if (patches.empty())
     {
         std::cout << "No boundary patches to write as sidesets" << std::endl;
         return;
-    }
-
-    // Ordered nodes for standard cells only; polyhedral cells resolve their
-    // boundary faces through polyFaceToSubs instead.
-    std::map<int, std::vector<int>> cellToOrderedNodes;
-    for (size_t i = 0; i < cells.size(); ++i)
-    {
-        const auto& cell = cells[i];
-        if (cell.type == "hex")
-            cellToOrderedNodes[i] = orderHexNodes(cell, faces, points);
-        else if (cell.type == "tet")
-            cellToOrderedNodes[i] = orderTetNodes(cell, faces, points);
-        else if (cell.type == "pyr")
-            cellToOrderedNodes[i] = orderPyramidNodes(cell, faces, points);
-        else if (cell.type == "wedge")
-            cellToOrderedNodes[i] = orderWedgeNodes(cell, faces, points);
     }
 
     // Build each patch's (elem, side) entries first. A boundary face of a
@@ -1392,18 +1499,16 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
             }
 
             int cellIdx = owner[faceIdx];
-            int exoId =
-                (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
-                    ? cellToExodusElem[cellIdx]
-                    : (cellIdx + 1);
+            if (cellIdx < 0 || cellIdx >= (int)cells.size())
+                continue;
+            int exoId = cellToExodusElem[cellIdx];
 
             const auto& face = faces[faceIdx];
             const auto& cell = cells[cellIdx];
             int sideId = 1;
-            auto cit = cellToOrderedNodes.find(cellIdx);
-            if (cit != cellToOrderedNodes.end())
+            const std::vector<int>& ordNodes = cellOrderedNodes[cellIdx];
+            if (!ordNodes.empty())
             {
-                const auto& ordNodes = cit->second;
                 if (cell.type == "hex")
                     sideId = getHexFaceId(face.pointIndices, ordNodes);
                 else if (cell.type == "tet")
@@ -1425,25 +1530,34 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         const auto& patch = patches[i];
         std::string ss_num = std::to_string(i + 1);
 
+        // A patch with no faces gets no dimension or variables at all: the
+        // classic netCDF model has no zero-length fixed dimension. It is still
+        // named and counted, but its status is set to 0 below.
+        if (patchElem[i].empty())
+            continue;
+
         int dim_num_side_ss;
-        nc_def_dim(ncid,
-                   ("num_side_ss" + ss_num).c_str(),
-                   patchElem[i].size(),
-                   &dim_num_side_ss);
+        checkError(nc_def_dim(ncid,
+                              ("num_side_ss" + ss_num).c_str(),
+                              patchElem[i].size(),
+                              &dim_num_side_ss),
+                   "Failed to define sideset dimension");
 
         int var_elem_ss, var_side_ss;
-        nc_def_var(ncid,
-                   ("elem_ss" + ss_num).c_str(),
-                   NC_INT,
-                   1,
-                   &dim_num_side_ss,
-                   &var_elem_ss);
-        nc_def_var(ncid,
-                   ("side_ss" + ss_num).c_str(),
-                   NC_INT,
-                   1,
-                   &dim_num_side_ss,
-                   &var_side_ss);
+        checkError(nc_def_var(ncid,
+                              ("elem_ss" + ss_num).c_str(),
+                              NC_INT,
+                              1,
+                              &dim_num_side_ss,
+                              &var_elem_ss),
+                   "Failed to define sideset element variable");
+        checkError(nc_def_var(ncid,
+                              ("side_ss" + ss_num).c_str(),
+                              NC_INT,
+                              1,
+                              &dim_num_side_ss,
+                              &var_side_ss),
+                   "Failed to define sideset side variable");
 
         std::string sidesetName = getSidesetName(patch.name);
         nc_put_att_text(ncid,
@@ -1478,13 +1592,16 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         const std::vector<int>& side_list = patchSide[i];
 
         int var_id;
-        nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
-        nc_put_var_int(ncid, var_id, elem_list.data());
+        if (!elem_list.empty())
+        {
+            nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
+            nc_put_var_int(ncid, var_id, elem_list.data());
 
-        nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
-        nc_put_var_int(ncid, var_id, side_list.data());
+            nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
+            nc_put_var_int(ncid, var_id, side_list.data());
+        }
 
-        int ss_status = 1;
+        int ss_status = elem_list.empty() ? 0 : 1;
         int var_status;
         nc_inq_varid(ncid, "ss_status", &var_status);
         size_t index = i;
@@ -1506,8 +1623,8 @@ void ExodusWriter::writeSideSets(const OpenFOAMMeshReader& reader)
         nc_put_vara_text(ncid, var_id, start, count, name_padded);
 
         std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
-                  << " with " << elem_list.size() << " sides ("
-                  << patch.nFaces << " boundary faces)" << std::endl;
+                  << " with " << elem_list.size() << " sides (" << patch.nFaces
+                  << " boundary faces)" << std::endl;
     }
 }
 
@@ -1531,6 +1648,11 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
                            reader.getOwner(),
                            boundaryStart);
 
+    // Nothing is written until every element that would go into the file has
+    // been checked, so a bad mesh fails loudly instead of producing a file
+    // with inverted or collapsed elements in it.
+    validateElements(reader.getPoints(), cells);
+
     int nStandardCells = 0;
     for (size_t i = 0; i < cells.size(); ++i)
         if (!cellDecomposed[i])
@@ -1551,7 +1673,7 @@ void ExodusWriter::writeMesh(const OpenFOAMMeshReader& reader)
             std::set<std::string> typesInZone;
             for (int cellIdx : zone.cellIndices)
             {
-                if (cellIdx < cells.size())
+                if (cellIdx < (int)cells.size())
                 {
                     if (!cellDecomposed[cellIdx])
                         typesInZone.insert(cells[cellIdx].type);
@@ -1650,6 +1772,11 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
                            reader.getOwner(),
                            boundaryStart);
 
+    // Nothing is written until every element that would go into the file has
+    // been checked, so a bad mesh fails loudly instead of producing a file
+    // with inverted or collapsed elements in it.
+    validateElements(reader.getPoints(), cells);
+
     int nStandardCells = 0;
     for (size_t i = 0; i < cells.size(); ++i)
         if (!cellDecomposed[i])
@@ -1670,7 +1797,7 @@ void ExodusWriter::writeMesh(const MergedMeshReader& reader)
             std::set<std::string> typesInZone;
             for (int cellIdx : zone.cellIndices)
             {
-                if (cellIdx < cells.size())
+                if (cellIdx < (int)cells.size())
                 {
                     if (!cellDecomposed[cellIdx])
                         typesInZone.insert(cells[cellIdx].type);
@@ -1742,8 +1869,6 @@ void ExodusWriter::writeMesh(
 void ExodusWriter::writeElements(const MergedMeshReader& reader)
 {
     const auto& cells = reader.getCells();
-    const auto& faces = reader.getFaces();
-    const auto& points = reader.getPoints();
     const auto& cellZones = reader.getCellZones();
 
     nc_redef(ncid);
@@ -1773,7 +1898,7 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
 
             for (int cellIdx : zone.cellIndices)
             {
-                if (cellIdx < cells.size())
+                if (cellIdx < (int)cells.size())
                 {
                     if (!cellDecomposed[cellIdx])
                         zoneElemsByType[cells[cellIdx].type].push_back(cellIdx);
@@ -1861,12 +1986,15 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         }
     }
 
+    int dim_len_name;
+    checkError(nc_inq_dimid(ncid, "len_name", &dim_len_name),
+               "Failed to get len_name dimension");
+
     int blockId = 1;
     for (const auto& block : blocks)
     {
-        int numElemsInBlock =
-            block.decomposed ? (int)block.subIndices.size()
-                             : (int)block.cellIndices.size();
+        int numElemsInBlock = block.decomposed ? (int)block.subIndices.size()
+                                               : (int)block.cellIndices.size();
 
         int numNodesPerElem = 8;
         std::string exoType = "HEX8";
@@ -1922,6 +2050,37 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
             ncid, var_connect, "elem_type", exoType.length(), exoType.c_str());
         checkError(status, "Failed to set element type attribute");
 
+        // Per-element attributes carrying the source-cell provenance. They are
+        // static Exodus attributes rather than transient element variables, so
+        // a pure mesh file stays free of time steps.
+        const std::vector<std::string>& attNames =
+            block.decomposed ? decomposedAttribNames() : standardAttribNames();
+        int dim_num_att;
+        status = nc_def_dim(ncid,
+                            ("num_att_in_blk" + blk_num).c_str(),
+                            attNames.size(),
+                            &dim_num_att);
+        checkError(status, "Failed to define element attribute dimension");
+
+        int var_attrib, var_attrib_name;
+        int dims_attrib[2] = {dim_num_el_in_blk, dim_num_att};
+        status = nc_def_var(ncid,
+                            ("attrib" + blk_num).c_str(),
+                            NC_DOUBLE,
+                            2,
+                            dims_attrib,
+                            &var_attrib);
+        checkError(status, "Failed to define element attribute variable");
+
+        int dims_attrib_name[2] = {dim_num_att, dim_len_name};
+        status = nc_def_var(ncid,
+                            ("attrib_name" + blk_num).c_str(),
+                            NC_CHAR,
+                            2,
+                            dims_attrib_name,
+                            &var_attrib_name);
+        checkError(status, "Failed to define element attribute name variable");
+
         blockId++;
     }
 
@@ -1934,6 +2093,7 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
     for (const auto& block : blocks)
     {
         std::vector<int> connectivity;
+        std::vector<double> attribSource;
 
         if (block.decomposed)
         {
@@ -1942,32 +2102,20 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
                 polySubElemExoId[gid] = nextExodusElem++;
                 for (int n : polySubElems[gid].nodes)
                     connectivity.push_back(n + 1);
+                attribSource.push_back(polySubElemCell[gid]);
+                attribSource.push_back(polySubElems[gid].srcFace);
+                attribSource.push_back(polySubElems[gid].srcSub);
             }
         }
         else
             for (int cellIdx : block.cellIndices)
             {
                 cellToExodusElem[cellIdx] = nextExodusElem++;
+                attribSource.push_back(cellIdx);
 
-                const auto& cell = cells[cellIdx];
-
-                std::vector<int> nodes;
-                if (block.cellType == "hex")
-                {
-                    nodes = orderHexNodes(cell, faces, points);
-                }
-                else if (block.cellType == "tet")
-                {
-                    nodes = orderTetNodes(cell, faces, points);
-                }
-                else if (block.cellType == "pyr")
-                {
-                    nodes = orderPyramidNodes(cell, faces, points);
-                }
-                else if (block.cellType == "wedge")
-                {
-                    nodes = orderWedgeNodes(cell, faces, points);
-                }
+                // Connectivity was matched and validated up front, so it is
+                // reused verbatim here and in the side sets.
+                const std::vector<int>& nodes = cellOrderedNodes[cellIdx];
 
                 int numNodesPerElem = (block.cellType == "tet")     ? 4
                                       : (block.cellType == "pyr")   ? 5
@@ -1975,15 +2123,16 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
                                                                     : 8;
                 if ((int)nodes.size() != numNodesPerElem)
                 {
-                    std::cerr << "Warning: cell " << cellIdx
-                              << " (type=" << block.cellType << ") returned "
-                              << nodes.size() << " nodes, expected "
-                              << numNodesPerElem << std::endl;
+                    throw std::runtime_error(
+                        "internal error: OpenFOAM cell " +
+                        std::to_string(cellIdx) + " (type=" + block.cellType +
+                        ") has " + std::to_string(nodes.size()) +
+                        " ordered nodes, expected " +
+                        std::to_string(numNodesPerElem));
                 }
                 for (int i = 0; i < numNodesPerElem; ++i)
                 {
-                    connectivity.push_back(i < (int)nodes.size() ? nodes[i] + 1
-                                                                 : 1);
+                    connectivity.push_back(nodes[i] + 1);
                 }
             }
 
@@ -1991,6 +2140,8 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
         nc_inq_varid(
             ncid, ("connect" + std::to_string(blockId)).c_str(), &var_id);
         nc_put_var_int(ncid, var_id, connectivity.data());
+
+        writeBlockAttributes(blockId, block.decomposed, attribSource);
 
         int eb_status = 1;
         int var_status;
@@ -2017,8 +2168,7 @@ void ExodusWriter::writeElements(const MergedMeshReader& reader)
                   << ") with "
                   << (block.decomposed ? block.subIndices.size()
                                        : block.cellIndices.size())
-                  << " elements"
-                  << std::endl;
+                  << " elements" << std::endl;
 
         blockId++;
     }
@@ -2030,28 +2180,11 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
     const auto& faces = reader.getFaces();
     const auto& owner = reader.getOwner();
     const auto& cells = reader.getCells();
-    const auto& points = reader.getPoints();
 
     if (patches.empty())
     {
         std::cout << "No boundary patches to write as sidesets" << std::endl;
         return;
-    }
-
-    // Ordered nodes for standard cells only; polyhedral cells resolve their
-    // boundary faces through polyFaceToSubs instead.
-    std::map<int, std::vector<int>> cellToOrderedNodes;
-    for (size_t i = 0; i < cells.size(); ++i)
-    {
-        const auto& cell = cells[i];
-        if (cell.type == "hex")
-            cellToOrderedNodes[i] = orderHexNodes(cell, faces, points);
-        else if (cell.type == "tet")
-            cellToOrderedNodes[i] = orderTetNodes(cell, faces, points);
-        else if (cell.type == "pyr")
-            cellToOrderedNodes[i] = orderPyramidNodes(cell, faces, points);
-        else if (cell.type == "wedge")
-            cellToOrderedNodes[i] = orderWedgeNodes(cell, faces, points);
     }
 
     // Build each patch's (elem, side) entries first. A boundary face of a
@@ -2084,18 +2217,16 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
             }
 
             int cellIdx = owner[faceIdx];
-            int exoId =
-                (cellIdx >= 0 && cellIdx < (int)cellToExodusElem.size())
-                    ? cellToExodusElem[cellIdx]
-                    : (cellIdx + 1);
+            if (cellIdx < 0 || cellIdx >= (int)cells.size())
+                continue;
+            int exoId = cellToExodusElem[cellIdx];
 
             const auto& face = faces[faceIdx];
             const auto& cell = cells[cellIdx];
             int sideId = 1;
-            auto cit = cellToOrderedNodes.find(cellIdx);
-            if (cit != cellToOrderedNodes.end())
+            const std::vector<int>& ordNodes = cellOrderedNodes[cellIdx];
+            if (!ordNodes.empty())
             {
-                const auto& ordNodes = cit->second;
                 if (cell.type == "hex")
                     sideId = getHexFaceId(face.pointIndices, ordNodes);
                 else if (cell.type == "tet")
@@ -2117,25 +2248,34 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         const auto& patch = patches[i];
         std::string ss_num = std::to_string(i + 1);
 
+        // A patch with no faces gets no dimension or variables at all: the
+        // classic netCDF model has no zero-length fixed dimension. It is still
+        // named and counted, but its status is set to 0 below.
+        if (patchElem[i].empty())
+            continue;
+
         int dim_num_side_ss;
-        nc_def_dim(ncid,
-                   ("num_side_ss" + ss_num).c_str(),
-                   patchElem[i].size(),
-                   &dim_num_side_ss);
+        checkError(nc_def_dim(ncid,
+                              ("num_side_ss" + ss_num).c_str(),
+                              patchElem[i].size(),
+                              &dim_num_side_ss),
+                   "Failed to define sideset dimension");
 
         int var_elem_ss, var_side_ss;
-        nc_def_var(ncid,
-                   ("elem_ss" + ss_num).c_str(),
-                   NC_INT,
-                   1,
-                   &dim_num_side_ss,
-                   &var_elem_ss);
-        nc_def_var(ncid,
-                   ("side_ss" + ss_num).c_str(),
-                   NC_INT,
-                   1,
-                   &dim_num_side_ss,
-                   &var_side_ss);
+        checkError(nc_def_var(ncid,
+                              ("elem_ss" + ss_num).c_str(),
+                              NC_INT,
+                              1,
+                              &dim_num_side_ss,
+                              &var_elem_ss),
+                   "Failed to define sideset element variable");
+        checkError(nc_def_var(ncid,
+                              ("side_ss" + ss_num).c_str(),
+                              NC_INT,
+                              1,
+                              &dim_num_side_ss,
+                              &var_side_ss),
+                   "Failed to define sideset side variable");
 
         std::string sidesetName = getSidesetName(patch.name);
         nc_put_att_text(ncid,
@@ -2170,13 +2310,16 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         const std::vector<int>& side_list = patchSide[i];
 
         int var_id;
-        nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
-        nc_put_var_int(ncid, var_id, elem_list.data());
+        if (!elem_list.empty())
+        {
+            nc_inq_varid(ncid, ("elem_ss" + ss_num).c_str(), &var_id);
+            nc_put_var_int(ncid, var_id, elem_list.data());
 
-        nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
-        nc_put_var_int(ncid, var_id, side_list.data());
+            nc_inq_varid(ncid, ("side_ss" + ss_num).c_str(), &var_id);
+            nc_put_var_int(ncid, var_id, side_list.data());
+        }
 
-        int ss_status = 1;
+        int ss_status = elem_list.empty() ? 0 : 1;
         int var_status;
         nc_inq_varid(ncid, "ss_status", &var_status);
         size_t index = i;
@@ -2198,8 +2341,8 @@ void ExodusWriter::writeSideSets(const MergedMeshReader& reader)
         nc_put_vara_text(ncid, var_id, start, count, name_padded);
 
         std::cout << "Wrote sideset " << (i + 1) << ": " << sidesetName
-                  << " with " << elem_list.size() << " sides ("
-                  << patch.nFaces << " boundary faces)" << std::endl;
+                  << " with " << elem_list.size() << " sides (" << patch.nFaces
+                  << " boundary faces)" << std::endl;
     }
 }
 
